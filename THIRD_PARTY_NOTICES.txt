@@ -1,0 +1,21 @@
+Source excerpts in this website originate from vLLM and vLLM-Ascend.
+
+vLLM: Copyright contributors to the vLLM project.
+https://github.com/vllm-project/vllm
+
+vLLM-Ascend: Copyright contributors to the vllm-ascend project.
+Some included source files carry Copyright (c) Huawei Technologies Co., Ltd.
+https://github.com/vllm-project/vllm-ascend
+
+The source excerpts remain licensed under the Apache License, Version 2.0.
+See licenses/Apache-2.0.txt. Original file paths, commits, and source links
+are shown beside excerpts. Line numbers are added for reading; snippets
+are abridged from their enclosing files and are not standalone programs.
+
+MRV2 excerpts: vLLM a97dacb7106ee49f39f3d1fc6ae1800ff724e01d,
+vLLM-Ascend 363af1c27954ff1f7ae5bd66eef06da62c2e3cd0.
+KV articles: vLLM fa75d3456d60a5ffe923818c4b495295675b38e1,
+vLLM-Ascend 363af1c27954ff1f7ae5bd66eef06da62c2e3cd0.
+
+Explanations and worked examples are personal learning notes, not official
+documentation or a claim of runtime compatibility between these revisions.

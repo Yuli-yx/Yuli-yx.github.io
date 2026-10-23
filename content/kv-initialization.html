@@ -1,0 +1,71 @@
+<section id="scope"><h2>先确定职责和实际顺序</h2><p>我们从 Attention 声明需求开始，一直跟到 Worker 分配 tensor 和 Scheduler 创建资源账本。例子为两个普通 Full Attention 层的单卡 GQA 模型：Q heads=4、KV heads=2、K/V head dimension=8、FP16、block size=4、max model length=16。最终 KV 预算假设为 8192 bytes。微小维度用于手算，不是某个 backend 的可运行配置。</p><div class="callout"><strong>当前初始化顺序：</strong>Engine 收集需求并规划 → Worker 初始化缓存并 warmup → Engine 创建 Scheduler 和 BlockPool。不要把 BlockPool 理解成设备 tensor 分配器。</div><figure><div class="flow"><div class="node"><b>Worker</b>模型层注册<br>生成规格</div><span class="arrow">→</span><div class="node"><b>Engine</b>收集预算<br>分组、规划</div><span class="arrow">→</span><div class="node"><b>Worker</b>分配 tensor<br>绑定到层</div><span class="arrow">→</span><div class="node"><b>Scheduler</b>建立 BlockPool<br>管理编号</div></div><figcaption>Executor 在 Engine 与 Workers 之间分发调用并汇总返回值；它不决定每层 KV 的语义。</figcaption></figure>{{source:engine-order}}</section>
+<section id="spec"><h2>Attention 注册自己，返回需求描述</h2><p><strong>执行者：Worker 中的模型层。</strong> Attention 构造时把实例注册到 <code>compilation_config.static_forward_context[prefix]</code>。外部随后通过注册表寻找 AttentionLayerBase 实例，而不是依赖层主动发送消息。</p><pre>static_forward_context = {
+    "L0": attention_layer_0,
+    "L1": attention_layer_1,
+}</pre>{{source:register}}<p>当外部调用 <code>get_kv_cache_spec(vllm_config)</code>，普通 Full Attention 返回包含 block_size、num_kv_heads、head_size、head_size_v、dtype 和量化模式的 <code>FullAttentionSpec</code>。它不在这里创建最终 KV tensor。</p>{{source:layer-spec}}<pre>本例每层 spec：
+    block_size = 4
+    num_kv_heads = 2
+    head_size = head_size_v = 8
+    dtype = float16
+
+state_content_size_bytes = (8 + 8) × 2 = 32 B
+page_size_bytes = 2 heads × 4 states × 32 B = 256 B</pre><p><code>page_size_bytes</code> 是规格的计算属性。对于此普通未量化例子，一个 token 对应一个 stored state。MLA、压缩状态或量化后的内容布局需要改用对应 spec 的定义，不能无条件套用 2×heads×dim 的公式。</p>{{source:page}}<h3>设计含义：把需求与分配分开</h3><p>Attention 知道自己需要保存什么，却不知道整个模型最终能分到多少内存。spec 让这一需求可以传回 Engine，由全局规划决定容量，再将实际缓存绑定回来。层、规划器与具体设备分配器因此有清晰的接口。</p></section>
+<section id="collect"><h2>Engine 发起收集，Executor 转发到 Worker</h2><pre>EngineCore._initialize_kv_caches()
+  → Executor.get_kv_cache_specs()
+    → collective_rpc("get_kv_cache_spec")
+      → Worker.get_kv_cache_spec()
+        → ModelRunner.get_kv_cache_spec()
+          → 每个已注册层.get_kv_cache_spec()</pre><p>Runner 收集结果时还会跳过显式复用其他层 KV 的层、跳过返回 None 的层，并允许 backend 定制 AttentionSpec 的物理打包要求。</p>{{source:collect}}<p>单 Worker 的返回结果为：</p><pre>kv_cache_specs = [
+    {"L0": spec_0, "L1": spec_1}   # Worker 0
+]</pre><p>外层是 Worker 列表，内层是层名到规格的字典。这些是可跨进程传递的元数据，不包含 Worker 的设备 tensor 地址。此时 Scheduler 尚未创建。</p><p>入口：<a href="{{url:executor}}">Executor.get_kv_cache_specs / determine_available_memory</a>。Worker 侧接口转到 Runner，注册表筛选见 <a href="{{url:get-layers}}">get_layers_from_vllm_config</a>。</p></section>
+<section id="budget"><h2>Worker 测内存，Engine 决定方案</h2><p><strong>Worker 的输出是字节预算。</strong> Engine 先协商 backend 支持的缓存布局，再通过 Executor 调用 <code>determine_available_memory()</code>。普通自动估算路径结合配置预算、权重和 profiling 峰值，扣除非 KV 开销；配置启用时还计入 CUDA graph 内存估算。</p><pre># 上游自动估算路径的核心关系；省略平台和配置分支
+available_kv_cache_memory_bytes = (
+    requested_memory
+    - profile_result.non_kv_cache_memory
+    - cudagraph_memory_estimate_applied
+)</pre><p>显式配置 <code>kv_cache_memory_bytes</code> 时走另一条路径。因此不能把 KV 预算简单等同于某时刻查询到的 free memory。本篇将最终返回值固定为 <code>[8192]</code>，避免把 profiling 的细节混进地址计算。</p><p><strong>Engine 的输出是 KVCacheConfig。</strong> 调用 <code>get_kv_cache_configs(config, specs_per_worker, available_memory)</code>：合并规格、全局分组、投影回各 Worker、检查最大长度是否可容纳、生成各 rank 的配置。多 Worker 普通路径最终取各 Worker 都能承受的 block 数，并重新规划较大 rank 的布局。</p><p>源码：<a href="{{url:memory}}">GPUWorker.determine_available_memory</a> · <a href="{{url:planning}}">get_kv_cache_configs</a>。</p><h3>为什么在 Engine 规划？</h3><p>Scheduler 将来发出的 block IDs 必须能在对应 Workers 上被一致解释。各 Worker 独立任意决定容量或分组，会破坏这一契约。Engine 负责协调，Worker 负责报告本地需求与本地资源，并落实分配。</p></section>
+<section id="group"><h2>两个层怎样变成一个 cache group</h2><p><strong>执行者：Engine 中的 planner。</strong> 本例两层 spec 可合并，走 <code>is_kv_cache_spec_uniform → _get_kv_cache_groups_uniform_spec → create_kv_cache_group_specs</code>。</p><pre>KVCacheGroupSpec(
+    layer_names=["L0", "L1"],
+    kv_cache_spec=merged_spec,
+)
+
+merged_spec.block_size = 4
+merged_spec.page_size_bytes = 256   # 仍然是一层的 page</pre><p>group 保存层集合；page 大小没有因为两层同组而自动变成 512。容量规划会显式累加各层成本。</p>{{source:uniform-group}}<p>同组意味着这些层可以共用请求到 block 的映射。Full Attention 与 Sliding Window 的保留规则不同，可能需要不同 group；不同物理尺寸但同类管理需求，也存在 UniformTypeKVCacheSpecs 路径。具体结果要看 planner，不能把“一种类名对应一个 group”当作通用规则。</p><p>Worker 随后在 cache group 内建立 AttentionGroup，按 backend、每层 spec 和 Q head 数等划分 metadata builders。缓存分组和执行分组分别服务不同契约。</p></section>
+<section id="capacity"><h2>容量：从每层 page 算到整个 BlockPool</h2><p>本例假设已协商到层在外的 <code>LBHNC</code> 布局，无额外 padding：</p><pre>L0 一个 page = 256 B
+L1 一个 page = 256 B
+一个池 block ID 的成本 = 256 + 256 = 512 B
+num_blocks = floor(8192 / 512) = 16
+backing_size = 16 × 512 = 8192 B</pre><p>不能用 8192 / 256 得到 32 个池 block，那只计入了一个层。一个 block ID 在本 group 中同时代表各层对应的 page。</p>{{source:capacity}}<h3>padding 在除法之前计入</h3><p>如果每层有效 page 256 B，但该布局要求物理 block stride 按 512 B 对齐，则每个池 block 成本是 1024 B，总 block 数变成 8。每块仍容纳 4 tokens；增加的是物理成本，不是 token 容量。当前 layer-outer 路径按每层的 stride alignment 向上取整，再求和。</p><div class="lab" data-capacity><h3>容量演算器</h3><p>模型：同一 group 的等规格 Full Attention 层；FP16，K/V dimension 相同，层在外。只演示 page 对齐，不模拟 backend 限制、graph 内存或运行时水位。</p><div class="controls"><label>层数<input name="layers" type="number" value="2" min="1" max="32"></label><label>每块 tokens<input name="tokens" type="number" value="4" min="1" max="128"></label><label>KV heads<input name="heads" type="number" value="2" min="1" max="128"></label><label>K/V head dim<input name="dim" type="number" value="8" min="1" max="1024"></label><label>KV 预算 / bytes<input name="budget" type="number" value="8192" min="1" max="1048576"></label><label>stride 对齐 / bytes<select name="align"><option value="1">1（无额外对齐）</option><option value="256">256</option><option value="512">512</option><option value="1024">1024</option></select></label></div><output aria-live="polite"></output><div class="block-grid" aria-label="前 32 个物理 block 示意"></div></div><p>当前普通多 group 上游路径的公共 block 成本取各组总成本的最大值，并考虑布局对齐；不同组覆盖同一 backing 的区域，一个 block ID 同时归属于一个 group。不能为每个 group 再乘一遍完整池容量。这一多 group 物理组织留到后续例子展开。</p></section>
+<section id="descriptor"><h2>生成布局描述，再分发到 Workers</h2><pre># 示意：当前例子的核心字段
+KVCacheConfig(
+    num_blocks=16,
+    kv_cache_groups=[group_0],
+    kv_cache_tensors=[KVCacheTensor(
+        size=8192,
+        layers=["L0", "L1"],
+        offset=0,
+        layer_stride=4096,
+        block_stride=256,
+    )],
+)</pre><p>其中 layer_stride = 16 blocks × 256 B。L0 区域为前 4096 B，L1 为后 4096 B。每个 descriptor 是分配和视图的说明书，还没有执行 torch.zeros。</p><figure><pre>backing / 8192 bytes
+0                    4096                    8192
+| L0: b0 b1 ... b15   | L1: b0 b1 ... b15     |
+
+L0 / block7 page 起点 = 0    + 7×256 = 1792 B
+L1 / block7 page 起点 = 4096 + 7×256 = 5888 B</pre><figcaption>同一个 block ID，通过不同层视图定位到不同字节区域。</figcaption></figure><p>Engine 还生成 scheduler 侧配置，将同一容量契约交给 Scheduler。Executor 发出 <code>initialize_from_config</code>，WorkerWrapper 使用 global_rank 选取本 Worker 的配置。</p></section>
+<section id="allocate"><h2>Worker 建表缓冲区、分配 tensor、绑定层</h2><pre>Worker.initialize_from_config(config)
+  → ModelRunner.initialize_kv_cache(config)
+    → 建立 AttentionGroup / metadata builders
+    → 建立每个 group 的 BlockTables 缓冲区
+    → init_kv_cache()
+      → allocate_kv_cache()
+      → create_kv_cache_views()
+      → bind_kv_cache_to_layers()</pre><p>本例单请求最长 16 tokens，需要 4 个 block table 有效条目；实际表容量还可能有对齐。这个宽度与整个池的 16 个物理 blocks 不同。表预先创建，业务请求的分配记录此时还未填入。</p><p>普通上游分配器为这些描述申请一个共享 backing：</p>{{source:allocate}}<p><code>int8</code> 只是让 raw buffer 以字节为单位计量，不代表 KV 是 INT8 量化。创建视图时再按 spec 解释成 FP16。本例每层标准化视图为 <code>[B,H,N,C]=[16,2,4,16]</code>，C=8+8 表示 K/V 内容，单层占 4096 B。</p>{{source:views}}<p><code>as_strided</code> 和 dtype view 使用已有 storage；它们不再次分配两份历史 KV。绑定时按 layer name 查找实例，调用 <code>layer.bind_kv_cache(cache)</code>。普通 AttentionLayerBase 的默认实现保存 <code>self.kv_cache=kv_cache</code>。</p><p>设计上，逻辑形状与物理 stride 解耦，使相同的 layer 接口可以由不同布局提供存储。backend 必须正确解释其支持的布局，不能只根据 shape 猜测连续性。</p></section>
+<section id="pool"><h2>Scheduler 最后建立编号账本</h2><p>Worker 初始化和相关 warmup 返回后，Engine 创建 Scheduler。构造链为：</p><pre>Scheduler
+  → KVCacheManager
+    → KVCacheCoordinator
+      → BlockPool(num_gpu_blocks=16)
+      → 每个 cache group 的管理器，共用这个池</pre>{{source:pool}}<p>BlockPool 为编号 0～15 创建 KVCacheBlock 管理对象，初始化空闲队列和缓存哈希索引，并把 block 0 取出作为 null block。初始普通可分配数量因此是 15。物理分配仍为 16 个 block 槽位。</p><p>当前 planner 在最大长度检查时已为 null block 预留成本。这个“15”是初始空闲资源数量，不直接等于业务可接纳请求数；请求长度、共享和运行时水位还会进一步影响接纳。</p><table><thead><tr><th>Scheduler 知道</th><th>Worker 知道</th></tr></thead><tbody><tr><td>group、block 编号、引用、请求到 blocks 的映射</td><td>本地 device、storage、dtype、stride 和 cache views</td></tr><tr><td>一个请求是否还需要新 block</td><td>一个 block ID 在每层实际对应哪个存储区域</td></tr><tr><td>空闲和可复用的资源数量</td><td>算子如何根据表和 metadata 访问这些区域</td></tr></tbody></table><p>二者通过 KVCacheConfig 和后续调度消息保持一致。设备指针不需要传入 Scheduler。分配 block ID 是资源管理操作，分配 torch.Tensor 是设备内存操作。</p></section>
+<section id="shared-table"><h2>不同层如何接入同一张表</h2><p>初始化建立了 <code>L0/L1 → group 0 → group 0 的表缓冲区</code>。请求进入后，假设 A 获得 <code>[2,7]</code>，这个列表只需按 group 管理一份。L0/L1 各自用它索引自己的 cache view。</p><p>运行时 metadata 构建按 group 取 <code>block_tables[group_id]</code>，交给该 group 的 metadata builders。一个 AttentionGroup 内的 layer names 会映射到同一个生成的 metadata 对象：</p>{{source:metadata}}<p>多个 AttentionGroup 可以基于同一个 cache group 的映射生成各自适配的 metadata。backend 可能生成转换后的表，所以“同组共用映射”不等于“所有层在所有路径永远拿同一个最终 tensor 对象”。</p></section>
+<section id="ascend"><h2>Ascend 保留职责，替换设备实现</h2><p>Ascend MRV2 通过 patch 接入自己的 spec 收集、分配、reshape 和绑定实现。查父类调用时必须继续确认符号绑定。</p>{{source:ascend-patch}}<table><thead><tr><th>环节</th><th>Ascend 入口</th></tr></thead><tbody><tr><td>收集 / 修正 specs</td><td>worker/v2/attn_utils.py::get_kv_cache_spec</td></tr><tr><td>NPU 内存预算</td><td>worker/worker.py::determine_available_memory</td></tr><tr><td>接收配置</td><td>worker/worker.py::initialize_from_config</td></tr><tr><td>分配与视图</td><td>allocate_kv_cache_main → _allocate_kv_cache → _reshape_kv_cache_v2</td></tr><tr><td>绑定到模型层</td><td>patch/worker/patch_bind_kv_cache.py</td></tr></tbody></table><p>本篇“一个 backing、两个标准化视图”针对上游普通分配器。Ascend 普通 Attention 可以按层申请 raw storage，再生成 K/V 视图；特殊 backend、混合模型和其他配置有不同分支。不能把上游分配次数、shape 或连续性直接当成 NPU 实现。</p>{{source:ascend-allocate}}<p>这两份源码仅用于静态解释，未验证版本组合的 NPU 运行兼容性。遇到接口或布局变化，应检查实际 patch、调用签名和运行配置。</p></section>
+<section id="recall"><h2>用结果反查你的理解</h2><table><thead><tr><th>初始化完成后</th><th>本例状态</th></tr></thead><tbody><tr><td>cache groups</td><td>1 个，包含 L0 和 L1</td></tr><tr><td>每层 page</td><td>256 B</td></tr><tr><td>每个池 block 成本</td><td>512 B</td></tr><tr><td>物理 blocks / 初始普通空闲 blocks</td><td>16 / 15</td></tr><tr><td>上游 backing / 每层视图</td><td>8192 B / 4096 B</td></tr><tr><td>业务请求映射</td><td>尚无请求，还未分配</td></tr></tbody></table><div class="recall"><p>如果增加为四层，预算仍为 8192 B，其他条件不变，总物理 blocks 和普通空闲 blocks 各是多少？</p><details><summary>核对计算</summary><p>每个池 block 成本为 4×256=1024 B；总计 8 个，保留 null block 后初始空闲 7 个。每层 shape 的 block 维度相应减少；Q heads 数没有进入该 KV 容量公式。</p></details><p>哪些组件做出了真正的设备内存分配？哪些只建立了元数据？</p><details><summary>核对职责</summary><p>Worker/Runner 的分配器建立实际存储和视图。Attention 提供 spec；Engine planner 产生方案；Scheduler 的管理器和 BlockPool 建立编号、引用及空闲队列等元数据。Worker 另外分配表和执行缓冲区，这部分不同于 KV backing 本身。</p></details></div><p>继续跟读时可以带着一个具体对象提问：它在哪里产生、谁持有、谁修改、谁消费。下一篇将跟踪请求第一次进入 Scheduler 后，block IDs 如何传到 MRV2。</p></section>

@@ -1,0 +1,229 @@
+{
+  "capturedAt": "2026-10-23",
+  "revisions": {
+    "vllm": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+    "vllm-ascend": "363af1c27954ff1f7ae5bd66eef06da62c2e3cd0"
+  },
+  "entries": {
+    "engine-order": {
+      "repo": "vllm",
+      "file": "vllm/v1/engine/core.py",
+      "start": 154,
+      "end": 184,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "6c561ef31fab3ffdefd3f2200be36aa1021bff23a025d68440df3190b2682aff",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/engine/core.py#L154-L184",
+      "code": " 154          measure_encoder_output_widths(vllm_config, self.collective_rpc)\n 155  \n 156          # Setup KV Caches and update CacheConfig after profiling.\n 157          kv_cache_config = self._initialize_kv_caches(vllm_config)\n 158          self.structured_output_manager = StructuredOutputManager(vllm_config)\n 159  \n 160          # Setup scheduler.\n 161          Scheduler = vllm_config.scheduler_config.get_scheduler_cls()\n 162  \n 163          if len(kv_cache_config.kv_cache_groups) == 0:  # noqa: SIM102\n 164              # Encoder models without KV cache don't support\n 165              # chunked prefill. But do SSM models?\n 166              if vllm_config.scheduler_config.enable_chunked_prefill:\n 167                  logger.warning(\"Disabling chunked prefill for model without KVCache\")\n 168                  vllm_config.scheduler_config.enable_chunked_prefill = False\n 169  \n 170          scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(\n 171              kv_cache_config, vllm_config\n 172          )\n 173  \n 174          self.scheduler: SchedulerInterface = Scheduler(\n 175              vllm_config=vllm_config,\n 176              kv_cache_config=kv_cache_config,\n 177              structured_output_manager=self.structured_output_manager,\n 178              include_finished_set=include_finished_set,\n 179              log_stats=self.log_stats,\n 180              block_size=scheduler_block_size,\n 181              hash_block_size=hash_block_size,\n 182          )\n 183          self._initialize_effective_attention_block_size()\n 184          self.use_spec_decode = vllm_config.speculative_config is not None"
+    },
+    "register": {
+      "repo": "vllm",
+      "file": "vllm/model_executor/layers/attention/attention.py",
+      "start": 438,
+      "end": 449,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "c14fbd7849ab314745a7138d88e56f4ac3b083ecafc668ca9ba6d9f7566fe6eb",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/model_executor/layers/attention/attention.py#L438-L449",
+      "code": " 438          # opaque custom op. For other platforms, we directly call them\n 439          # and let torch.compile handle them.\n 440          self.use_direct_call = not current_platform.opaque_attention_op()\n 441  \n 442          compilation_config = vllm_config.compilation_config\n 443          if prefix in compilation_config.static_forward_context:\n 444              raise ValueError(f\"Duplicate layer name: {prefix}\")\n 445          compilation_config.static_forward_context[prefix] = self\n 446          self.attn_type = attn_type\n 447  \n 448          if kv_sharing_target_layer_name is not None:\n 449              validate_kv_sharing_target("
+    },
+    "layer-spec": {
+      "repo": "vllm",
+      "file": "vllm/model_executor/layers/attention/attention.py",
+      "start": 669,
+      "end": 679,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "c14fbd7849ab314745a7138d88e56f4ac3b083ecafc668ca9ba6d9f7566fe6eb",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/model_executor/layers/attention/attention.py#L669-L679",
+      "code": " 669          else:\n 670              return FullAttentionSpec(\n 671                  block_size=block_size,\n 672                  num_kv_heads=self.num_kv_heads,\n 673                  head_size=self.head_size,\n 674                  head_size_v=self.head_size_v,\n 675                  dtype=self.kv_cache_torch_dtype,\n 676                  kv_quant_mode=quant_mode,\n 677              )\n 678  \n 679  "
+    },
+    "page": {
+      "repo": "vllm",
+      "file": "vllm/v1/kv_cache_interface.py",
+      "start": 544,
+      "end": 561,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "3434a3bca6680f4adcf4432552ad99b9dcca95353457a3c81674209932f91dad",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/kv_cache_interface.py#L544-L561",
+      "code": " 544      @property\n 545      def state_content_size_bytes(self) -> int:\n 546          \"\"\"Bytes per (head slot, stored state) cell of the page.\"\"\"\n 547          if self.state_content_bytes is not None:\n 548              return self.state_content_bytes\n 549          return (self.head_size + self.head_size_v) * get_dtype_size(self.dtype)\n 550  \n 551      @property\n 552      def unpadded_page_size_bytes(self) -> int:\n 553          return self.num_heads * self.num_states * self.state_content_size_bytes\n 554  \n 555      @property\n 556      def page_size_bytes(self) -> int:\n 557          if self.page_size_padded is not None:\n 558              assert self.page_size_padded >= self.unpadded_page_size_bytes\n 559              return self.page_size_padded\n 560          return self.unpadded_page_size_bytes\n 561  "
+    },
+    "collect": {
+      "repo": "vllm",
+      "file": "vllm/v1/worker/gpu/attn_utils.py",
+      "start": 139,
+      "end": 155,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "ade2dadd2cfac73398a944efe9aaefa837d2aee510651fe0027960c72833f102",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/worker/gpu/attn_utils.py#L139-L155",
+      "code": " 139  def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:\n 140      kv_cache_spec: dict[str, KVCacheSpec] = {}\n 141      layer_type = cast(type[Any], AttentionLayerBase)\n 142      attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)\n 143      for layer_name, attn_module in attn_layers.items():\n 144          if getattr(attn_module, \"kv_sharing_target_layer_name\", None):\n 145              # This layer will use KV cache of the sharing target layer.\n 146              continue\n 147          # Skip modules that don't need KV cache (eg encoder-only attention)\n 148          if spec := attn_module.get_kv_cache_spec(vllm_config):\n 149              if isinstance(spec, AttentionSpec):\n 150                  spec = customize_attention_spec(attn_module.get_attn_backend(), spec)\n 151              kv_cache_spec[layer_name] = spec\n 152      if vllm_config.attention_config.hisparse_config is not None:\n 153          kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)\n 154      return kv_cache_spec\n 155  "
+    },
+    "groups": {
+      "repo": "vllm",
+      "file": "vllm/v1/worker/gpu/attn_utils.py",
+      "start": 235,
+      "end": 266,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "ade2dadd2cfac73398a944efe9aaefa837d2aee510651fe0027960c72833f102",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/worker/gpu/attn_utils.py#L235-L266",
+      "code": " 235                  envs.VLLM_BATCH_INVARIANT\n 236                  and not attn_backend.supports_batch_invariance()\n 237              ):\n 238                  raise RuntimeError(\n 239                      \"VLLM batch_invariant mode is not supported for \"\n 240                      f\"{attn_backend.get_name()}.\"\n 241                  )\n 242              if layer_name in fast_prefill_eligible_layers:\n 243                  attn_backend = create_fast_prefill_custom_backend(\n 244                      \"FastPrefill\", attn_backend\n 245                  )\n 246  \n 247              layer_kv_cache_spec: KVCacheSpec = kv_cache_group_spec.kv_cache_spec\n 248              if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):\n 249                  layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]\n 250  \n 251              # Split on per-rank num_heads_q so layers with different Q-head\n 252              # counts (e.g. a spec-decode draft head and its target) get separate\n 253              # metadata builders.\n 254              num_heads_q = getattr(attn_layers[layer_name], \"num_heads\", 0)\n 255              key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)\n 256              if key not in group_map:\n 257                  group_map[key] = AttentionGroup(\n 258                      attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id\n 259                  )\n 260                  group_order.append(key)\n 261              else:\n 262                  group_map[key].layer_names.append(layer_name)\n 263  \n 264          attn_groups.append([group_map[key] for key in group_order])\n 265  \n 266      # Phase 2: pick a kernel block size per kv cache group that is supported"
+    },
+    "coordinator": {
+      "repo": "vllm",
+      "file": "vllm/v1/core/kv_cache_coordinator.py",
+      "start": 157,
+      "end": 173,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "9e5e0c482d73b119b8f6bf928dcd3e5669c956fb6f1b4ff57ca126190435a052",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/core/kv_cache_coordinator.py#L157-L173",
+      "code": " 157          self.single_type_managers = tuple(\n 158              get_manager_for_kv_cache_spec(\n 159                  kv_cache_spec=kv_cache_group.kv_cache_spec,\n 160                  max_in_flight_tokens=max_in_flight_tokens,\n 161                  max_model_len=max_model_len,\n 162                  block_pool=self.block_pool,\n 163                  role=kv_cache_group.role,\n 164                  enable_caching=enable_caching,\n 165                  kv_cache_group_id=i,\n 166                  dcp_world_size=dcp_world_size,\n 167                  pcp_world_size=pcp_world_size,\n 168                  scheduler_block_size=self.scheduler_block_size,\n 169                  needs_kv_cache_zeroing=self.kv_cache_config.needs_kv_cache_zeroing,\n 170              )\n 171              for i, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups)\n 172          )\n 173          # Match Mamba checkpoints to Eagle's attention replay boundary."
+    },
+    "uniform-group": {
+      "repo": "vllm",
+      "file": "vllm/v1/core/kv_cache_planning.py",
+      "start": 186,
+      "end": 214,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "9b172d4ecc869fee8bcd3cee8107876e0a474ed55a0177944d5d56a847295670",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/core/kv_cache_planning.py#L186-L214",
+      "code": " 186  def create_kv_cache_group_specs(\n 187      kv_cache_spec: dict[str, KVCacheSpec], grouped_layer_names: list[list[str]]\n 188  ) -> list[KVCacheGroupSpec]:\n 189      \"\"\"Create KVCacheGroupSpec object for each kv cache group layer.\n 190      The layers in the same group should share the same\n 191      KVCacheSpec.\n 192  \n 193      Args:\n 194          kv_cache_spec:\n 195              A mapping from each layer name to its corresponding KVCacheSpec.\n 196          grouped_layer_names:\n 197              A list of kv cache groups, where each element is a list of layer\n 198              names that belong to the same group and should share the same\n 199              KVCacheSpec.\n 200  \n 201      Returns:\n 202          A list of KVCacheGroupSpec objects, one for each group.\n 203  \n 204      \"\"\"\n 205      kv_cache_groups = []\n 206      for layer_names_one_group in grouped_layer_names:\n 207          layer_specs = [\n 208              kv_cache_spec[layer_name] for layer_name in layer_names_one_group\n 209          ]\n 210          merged_layer_spec = layer_specs[0].merge(layer_specs)\n 211          kv_cache_groups.append(\n 212              KVCacheGroupSpec(layer_names_one_group, merged_layer_spec)\n 213          )\n 214      return kv_cache_groups"
+    },
+    "capacity": {
+      "repo": "vllm",
+      "file": "vllm/v1/core/kv_cache_planning.py",
+      "start": 632,
+      "end": 640,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "9b172d4ecc869fee8bcd3cee8107876e0a474ed55a0177944d5d56a847295670",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/core/kv_cache_planning.py#L632-L640",
+      "code": " 632  \n 633      layout = vllm_config.cache_config.get_resolved_kv_cache_layout()\n 634      validate_kv_cache_layout(layout, kv_cache_groups)\n 635      bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)\n 636      interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None\n 637  \n 638      num_blocks = available_memory // bytes_per_block\n 639      num_blocks = may_override_num_blocks(vllm_config, num_blocks)\n 640      size = bytes_per_block * num_blocks"
+    },
+    "descriptor": {
+      "repo": "vllm",
+      "file": "vllm/v1/kv_cache_interface.py",
+      "start": 1408,
+      "end": 1430,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "3434a3bca6680f4adcf4432552ad99b9dcca95353457a3c81674209932f91dad",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/kv_cache_interface.py#L1408-L1430",
+      "code": "1408  @dataclass\n1409  class KVCacheTensor:\n1410      \"\"\"A class for specifying how the workers should initialize the KV cache.\n1411  \n1412      Placement of a set of same-shaped layers in the KV cache allocation.\n1413      Layer ``layers[l]``'s page for block ``b`` starts at\n1414      ``offset + l * layer_stride + b * block_stride`` bytes into the backing\n1415      allocation of ``size`` bytes. Layer-outermost layouts give each layer a\n1416      contiguous region (``layer_stride = page * num_blocks``,\n1417      ``block_stride = page``); block-outermost layouts make each block a\n1418      block of all layers' pages (``layer_stride = page``, ``block_stride`` =\n1419      the packed block). Tensors whose address ranges overlap\n1420      alias the same bytes: cache groups overlay each other, which is sound\n1421      because a block ID is owned by one group at a time.\n1422      \"\"\"\n1423  \n1424      size: int  # total size of the backing allocation in bytes\n1425      layers: list[str]  # layer names in L order\n1426      layer_stride: int\n1427      block_stride: int\n1428      offset: int = 0  # byte offset of layers[0]'s block 0\n1429      host_resident: bool = False\n1430  "
+    },
+    "allocate": {
+      "repo": "vllm",
+      "file": "vllm/v1/worker/utils.py",
+      "start": 564,
+      "end": 602,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "ea522ab1dab50ea092b7cd00a2300bce37b79cc87298488839ce1dfc6afb62d2",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/worker/utils.py#L564-L602",
+      "code": " 564  def allocate_kv_cache(\n 565      kv_cache_config: KVCacheConfig,\n 566      device: torch.device,\n 567      layout: KVCacheLayout,\n 568      kernel_block_sizes: list[int] | None = None,\n 569  ) -> dict[str, torch.Tensor]:\n 570      \"\"\"Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.\n 571  \n 572      Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of\n 573      block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache\n 574      groups overlay each other, so tensors may address the same bytes.\n 575      \"\"\"\n 576      if not kv_cache_config.kv_cache_tensors:\n 577          return {}\n 578  \n 579      sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}\n 580      assert len(sizes) == 1, \"KV cache tensors must share one backing allocation.\"\n 581      raw_size = sizes.pop()\n 582      # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)\n 583      # are created lazily on the first qualifying GEMM. Force that now, before\n 584      # the giant backing allocation below: if one landed in this segment's\n 585      # rounding tail it would pin the whole segment at engine shutdown.\n 586      if current_platform.is_rocm():\n 587          warmup_rocm_skinny_gemm_workspaces(device)\n 588          # Pad to the page granularity MoRIIO needs to register the shared\n 589          # backing as a single RDMA memory region. Other platforms keep the\n 590          # exact-size allocation (see #53974), so anything reading\n 591          # storage.nbytes() has to tolerate the tail on ROCm alone.\n 592          page_size = 4096\n 593          buf_size = ((raw_size + page_size - 1) // page_size) * page_size\n 594      else:\n 595          buf_size = raw_size\n 596      buf = torch.zeros(buf_size, dtype=torch.int8, device=device)\n 597  \n 598      kv_caches: dict[str, torch.Tensor] = {}\n 599      for tensor in kv_cache_config.kv_cache_tensors:\n 600          layer_name = tensor.layers[0]\n 601          group_id, group = next(\n 602              (group_id, group)"
+    },
+    "views": {
+      "repo": "vllm",
+      "file": "vllm/v1/kv_cache_interface.py",
+      "start": 422,
+      "end": 449,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "3434a3bca6680f4adcf4432552ad99b9dcca95353457a3c81674209932f91dad",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/kv_cache_interface.py#L422-L449",
+      "code": " 422          layout,\n 423          kernel_block_size,\n 424          fixed_strides=(layer_stride, block_stride, None, None, None),\n 425      )\n 426      dtype = getattr(spec, \"dtype\", None)\n 427  \n 428      view_5d = torch.as_strided(\n 429          raw,\n 430          size=logical_shape,\n 431          stride=strides,\n 432          storage_offset=raw.storage_offset() + kv_cache_tensor.offset,\n 433      )\n 434  \n 435      views = []\n 436      for layer_idx in range(num_layers):\n 437          cache_logical = view_5d[layer_idx]\n 438          if dtype is not None:\n 439              cache_logical = cache_logical.view(dtype)\n 440          views.append(cache_logical)\n 441      return views\n 442  \n 443  \n 444  @dataclass(frozen=True, kw_only=True)\n 445  class HiSparseHotSpec(KVCacheSpec):\n 446      \"\"\"Ephemeral per-request HiSparse hot-cache allocation.\"\"\"\n 447  \n 448      page_size: int\n 449      blocks_per_request: int"
+    },
+    "pool": {
+      "repo": "vllm",
+      "file": "vllm/v1/core/block_pool.py",
+      "start": 166,
+      "end": 188,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "7cc463e8a53ece747739784eec1a99c3eed44df59ffebedafd866834654728d3",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/core/block_pool.py#L166-L188",
+      "code": " 166          assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0\n 167          self.num_gpu_blocks = num_gpu_blocks\n 168          self.medium = medium\n 169          self.enable_caching = enable_caching\n 170          self.hash_block_size = hash_block_size\n 171          # All kv-cache blocks.\n 172          self.blocks: list[KVCacheBlock] = [\n 173              KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)\n 174          ]\n 175          # Free block queue that constructs and manipulates a doubly linked\n 176          # list of free blocks (including eviction candidates when caching is\n 177          # enabled).\n 178          self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)\n 179  \n 180          # Cache for block lookup\n 181          self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()\n 182          self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}\n 183  \n 184          # To represent a placeholder block with block_id=0.\n 185          # The ref_cnt of null_block is not maintained, needs special care to\n 186          # avoid freeing it.\n 187          self.null_block = self.free_block_queue.popleft()\n 188          self.null_block.is_null = True"
+    },
+    "pool-free": {
+      "repo": "vllm",
+      "file": "vllm/v1/core/block_pool.py",
+      "start": 776,
+      "end": 807,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "7cc463e8a53ece747739784eec1a99c3eed44df59ffebedafd866834654728d3",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/core/block_pool.py#L776-L807",
+      "code": " 776      def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:\n 777          \"\"\"Free a list of blocks. The blocks should be ordered by their\n 778          eviction priority, where the first block will be evicted first.\n 779  \n 780          Args:\n 781              ordered_blocks: A list of blocks to free ordered by their eviction\n 782                  priority.\n 783  \n 784          \"\"\"\n 785          # Identify blocks with hash (LRU cache) and without it (never match APC)\n 786          blocks_to_evict_last = []\n 787          blocks_to_evict_first = []\n 788          other_pools: dict[BlockPool, list[KVCacheBlock]] = {}\n 789          for block in ordered_blocks:\n 790              if block.is_null:  # never pooled; its ref_cnt is not maintained\n 791                  continue\n 792              if block.pool is not None and block.pool is not self:\n 793                  other_pools.setdefault(block.pool, []).append(block)\n 794                  continue\n 795              block.ref_cnt -= 1\n 796              if block.ref_cnt == 0:\n 797                  if block.block_hash is None or not self.enable_caching:\n 798                      # LIFO reuse of non-cached blocks for better GPU locality.\n 799                      blocks_to_evict_first.append(block)\n 800                  else:\n 801                      # FIFO reuse of cached blocks for LRU eviction behavior.\n 802                      blocks_to_evict_last.append(block)\n 803  \n 804          # Blocks to reuse first are prepended to the front of the free queue.\n 805          self.free_block_queue.prepend_n(blocks_to_evict_first)\n 806          # Blocks to reuse last are appended to the end of the free queue.\n 807          self.free_block_queue.append_n(blocks_to_evict_last)"
+    },
+    "slots": {
+      "repo": "vllm",
+      "file": "vllm/v1/worker/gpu/block_table.py",
+      "start": 339,
+      "end": 352,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "ee3aec80418b391d203a8a9986c8db9fe559beb336388cd0b0b13b8a9e87413b",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/worker/gpu/block_table.py#L339-L352",
+      "code": " 339              is_local = ~sharded | is_local\n 340  \n 341          block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)\n 342          block_offsets = local_positions % kv_block_size\n 343          block_numbers = tl.load(\n 344              block_table_ptr + req_state_idx * block_table_stride + block_indices,\n 345              mask=is_local & is_real_req,\n 346              other=0,\n 347          )\n 348          slot_ids = block_numbers * kv_block_size + block_offsets\n 349          if CP_SIZE != 1:\n 350              slot_ids = tl.where(is_local, slot_ids, PAD_ID)\n 351  \n 352          slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)"
+    },
+    "metadata": {
+      "repo": "vllm",
+      "file": "vllm/v1/worker/gpu/attn_utils.py",
+      "start": 570,
+      "end": 594,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "ade2dadd2cfac73398a944efe9aaefa837d2aee510651fe0027960c72833f102",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/worker/gpu/attn_utils.py#L570-L594",
+      "code": " 570                      if model_specific_attn_metadata is not None\n 571                      else {}\n 572                  )\n 573                  metadata = attn_group.build_metadata(\n 574                      common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs\n 575                  )\n 576              if reuse_key is not None and reuse_key not in cached_metadata:\n 577                  cached_metadata[reuse_key] = metadata\n 578              for layer_name in attn_group.layer_names:\n 579                  attn_metadata[layer_name] = metadata\n 580          token_to_req_indices = common_attn_metadata._token_to_req_indices_cache\n 581      return attn_metadata\n 582  \n 583  \n 584  def compute_mm_prefix_ranges(\n 585      req_ids: list[str],\n 586      mm_features: dict[str, list[MultiModalFeatureSpec]],\n 587      sliding_window: int | None = None,\n 588  ) -> dict[int, list[tuple[int, int]]]:\n 589      \"\"\"Compute PrefixLM bidirectional ranges for multimodal tokens.\n 590  \n 591      Ranges exceeding sliding_window are skipped to prevent early tokens\n 592      from attending across the entire image span.\n 593      \"\"\"\n 594      req_doc_ranges: dict[int, list[tuple[int, int]]] = {}"
+    },
+    "ascend-patch": {
+      "repo": "vllm-ascend",
+      "file": "vllm_ascend/patch/worker/patch_v2/patch_attn_utils.py",
+      "start": 23,
+      "end": 35,
+      "commit": "363af1c27954ff1f7ae5bd66eef06da62c2e3cd0",
+      "sha256": "3fea63651815e4b0fd7f4ebbeaa6b48b6a1e702eda5378d3308a28186b53d1da",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/patch/worker/patch_v2/patch_attn_utils.py#L23-L35",
+      "code": "  23  vllm.v1.worker.gpu.attn_utils._allocate_kv_cache = _allocate_kv_cache\n  24  vllm.v1.worker.gpu.attn_utils._reshape_kv_cache = _reshape_kv_cache_v2\n  25  # vLLM #51718 made this the live allocation symbol used by init_kv_cache.\n  26  vllm.v1.worker.gpu.attn_utils.allocate_kv_cache = allocate_kv_cache_main\n  27  gpu_model_runner_v2.init_kv_cache.__globals__[\"allocate_kv_cache\"] = allocate_kv_cache_main\n  28  gpu_model_runner_v2.init_kv_cache.__globals__[\"bind_kv_cache\"] = bind_kv_cache\n  29  \n  30  vllm.v1.worker.gpu.attn_utils.bind_kv_cache = bind_kv_cache\n  31  # vLLM main (#53781) routes init_kv_cache through bind_kv_cache_to_layers,\n  32  # which Ascend overrides with direct raw-allocation binding.\n  33  vllm.v1.worker.gpu.attn_utils.bind_kv_cache_to_layers = bind_kv_cache_to_layers\n  34  \n  35  vllm.v1.worker.gpu.model_runner.get_kv_cache_spec = get_kv_cache_spec"
+    },
+    "ascend-allocate": {
+      "repo": "vllm-ascend",
+      "file": "vllm_ascend/worker/v2/attn_utils.py",
+      "start": 1337,
+      "end": 1362,
+      "commit": "363af1c27954ff1f7ae5bd66eef06da62c2e3cd0",
+      "sha256": "cfcd6b875912c298b1ec1a56817ad19e07fed9143709ecc7e883cc7763269262",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/attn_utils.py#L1337-L1362",
+      "code": "1337  def allocate_kv_cache_main(\n1338      kv_cache_config: KVCacheConfig,\n1339      device: torch.device,\n1340      layout: Any,\n1341      kernel_block_sizes: list[int],\n1342  ) -> dict[str, Any]:\n1343      \"\"\"Allocate Ascend KV cache through vLLM main's #51718 entry point.\n1344  \n1345      vLLM #51718 replaced ``_allocate_kv_cache`` + ``_reshape_kv_cache`` with\n1346      ``allocate_kv_cache`` and generic ``[B, H, N, C]`` views. Ascend attention\n1347      still consumes separate K/V (and backend-specific state) tensors, so keep\n1348      the Ascend allocation/reshape contract behind the new entry point.\n1349      \"\"\"\n1350      del layout\n1351      vllm_config = get_current_vllm_config()\n1352      attn_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase)\n1353      shared_layers = {\n1354          layer_name: target_layer\n1355          for layer_name, layer in attn_layers.items()\n1356          if (target_layer := getattr(layer, \"kv_sharing_target_layer_name\", None))\n1357      }\n1358  \n1359      raw_tensors = _allocate_kv_cache(\n1360          kv_cache_config,\n1361          shared_layers=shared_layers,\n1362          device=device,"
+    },
+    "executor": {
+      "repo": "vllm",
+      "file": "vllm/v1/executor/abstract.py",
+      "start": 156,
+      "end": 160,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "4b886b46d5797d380d78d7620ff8a6adf14d268bd2fa17fbd1408e6d20a484b5",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/executor/abstract.py#L156-L160",
+      "code": " 156      def determine_available_memory(self) -> list[int]:  # in bytes\n 157          return self.collective_rpc(\"determine_available_memory\")\n 158  \n 159      def get_kv_cache_specs(self) -> list[dict[str, KVCacheSpec]]:\n 160          return self.collective_rpc(\"get_kv_cache_spec\")"
+    },
+    "get-layers": {
+      "repo": "vllm",
+      "file": "vllm/config/vllm.py",
+      "start": 3571,
+      "end": 3593,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "52b74b0dd120f3076ff62002d2d312e1021141db0cbffe65a6ed178314faf974",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/config/vllm.py#L3571-L3593",
+      "code": "3571  def get_layers_from_vllm_config(\n3572      vllm_config: VllmConfig,\n3573      layer_type: type[T],\n3574      layer_names: Iterable[str] | None = None,\n3575  ) -> dict[str, T]:\n3576      \"\"\"Get layers from the vLLM config.\n3577  \n3578      Args:\n3579          vllm_config: The vLLM config.\n3580          layer_type: The type of the layer to get.\n3581          layer_names: The names of the layers to get. If None, return all layers.\n3582  \n3583      \"\"\"\n3584      forward_context = vllm_config.compilation_config.static_forward_context\n3585      if layer_names is None:\n3586          layer_names = forward_context.keys()\n3587  \n3588      return {\n3589          layer_name: layer\n3590          for layer_name in layer_names\n3591          if isinstance(layer := forward_context.get(layer_name), layer_type)\n3592      }\n3593  "
+    },
+    "memory": {
+      "repo": "vllm",
+      "file": "vllm/v1/worker/gpu_worker.py",
+      "start": 638,
+      "end": 638,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "13a8bc4571d285ca52c4634a099dea4de1a9370ca710d1ad6e6096acf81aef7b",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/worker/gpu_worker.py#L638-L638",
+      "code": " 638      def determine_available_memory(self) -> int:"
+    },
+    "planning": {
+      "repo": "vllm",
+      "file": "vllm/v1/core/kv_cache_planning.py",
+      "start": 1481,
+      "end": 1481,
+      "commit": "fa75d3456d60a5ffe923818c4b495295675b38e1",
+      "sha256": "9b172d4ecc869fee8bcd3cee8107876e0a474ed55a0177944d5d56a847295670",
+      "url": "https://github.com/Yuli-yx/vllm/blob/fa75d3456d60a5ffe923818c4b495295675b38e1/vllm/v1/core/kv_cache_planning.py#L1481-L1481",
+      "code": "1481  def get_kv_cache_configs("
+    }
+  }
+}

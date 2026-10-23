@@ -1,0 +1,140 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MRV2 · Ascend 怎样接住上游 MRV2？</title><link rel="stylesheet" href="../assets/course.css"><link rel="stylesheet" href="../assets/deep-course.css"><script defer src="../assets/deep-course.js"></script></head><body><nav data-course-root style="max-width:1080px;margin:0 auto;padding:14px 42px 0;font-size:13px"><a href="../../../index.html">← 推理系统源码笔记</a></nav><header><div class="topline"><span class="brand">MRV2 / 实现跟读</span><span>先理解实现 · P/D 延后</span></div><nav class="course-nav"><a href="../index.html">课程首页</a><a href="0002-v1-v2-state-design.html">01 · 设计差异</a><a href="0003-build-one-input.html">02 · 输入实算</a><a href="0004-execute-sample-async.html">03 · 执行与异步</a><a href="0005-ascend-integration.html" aria-current="page">04 · Ascend 适配</a></nav><div class="hero"><div class="eyebrow">实现课 04 / 约 10 分钟</div><h1>Ascend 怎样接住<br>上游 MRV2？</h1><p class="lead">沿继承、覆盖、组件替换和模块 patch，判断 NPU 最终执行的到底是哪段实现。</p><div class="chips"><span class="chip">vLLM a97dacb7106e</span><span class="chip">Ascend 363af1c27954</span><span class="chip">2026-10-16 · 静态源码</span></div></div></header><main><div class="reading-goal"><strong>本课首选源码：</strong><a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/model_runner.py#L135">NPUModelRunner</a> 与 <a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/patch/worker/__init__.py#L60">Worker patch 导入表</a>。先读正文理解关系，再展开源码对照。</div><section class="section"><div class="sectionno">01 / 两条继承链</div><h2>类名相同，父类导入路径不同。</h2><pre>Ascend MRV1:
+  worker/model_runner_v1.py::NPUModelRunner
+    → vllm.v1.worker.gpu_model_runner.GPUModelRunner
+
+Ascend MRV2:
+  worker/v2/model_runner.py::NPUModelRunner
+    → vllm.v1.worker.gpu.model_runner.GPUModelRunner</pre><p>Worker 根据 runner 配置选择实际类。Ascend MRV2 继承公共执行主干，但还会覆盖方法、替换组件和模块符号。因此看到 <code>super().execute_model()</code>，下一跳既要读父类，也要核对运行前已生效的 patch。</p><details class="source"><summary>NPU MRV2 继承上游 MRV2 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/model_runner.py:135</div><pre> 135  class NPUModelRunner(GPUModelRunner):
+ 136      &quot;&quot;&quot;Model runner for Ascend NPUs.&quot;&quot;&quot;
+ 137  
+ 138      # vLLM #51718 overlays hybrid Attention/Mamba groups in one standardized
+ 139      # backing allocation. Ascend MRV2 preserves that allocation and exposes
+ 140      # backend-specific views; MLA may use a page-strided fused/component view.
+ 141      supports_standardized_shared_kv_backing = True
+ 142  
+ 143      execute_model_state: ExecuteModelState | None
+ 144      max_num_reqs: int
+ 145  
+ 146      def __init__(self, vllm_config: VllmConfig, device: torch.device):</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>真实主干：调用父类 execute_model · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/model_runner.py:640</div><pre> 640                  output = super().execute_model(
+ 641                      scheduler_output,
+ 642                      intermediate_tensors=intermediate_tensors,
+ 643                      dummy_run=dummy_run,
+ 644                      skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+ 645                      is_profile=is_profile,
+ 646                      context_len=context_len,
+ 647                      valid_dummy_state_slots=valid_dummy_state_slots,
+ 648                      **profile_kwargs,
+ 649                  )
+ 650                  forward_failed = False</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/model_runner.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">02 / 显式替换组件</div><h2>请求状态与本轮输入，仍有 Ascend 需求。</h2><p>构造时，NPU runner 用 <code>AscendRequestState</code> 和 <code>AscendInputBuffers</code> 替换父类的实例。前者为上游 NumPy computed 镜像提供共享内存的 torch CPU view；后者保留 CPU seq_lens，并为 FULL 图的 query 边界预留额外空间。</p><details class="source"><summary>RequestState：torch CPU view 与 NumPy 共享存储 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/states.py:44</div><pre>  44          # Ascend attention needs a torch CPU view of the upstream NumPy state.
+  45          # Sharing storage keeps both APIs coherent without duplicate writes.
+  46          self.num_computed_tokens_cpu: torch.Tensor = torch.from_numpy(self.num_computed_tokens_np)</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/states.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>Ascend input buffers：query 边界与 CPU seq_lens · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/input_batch.py:47</div><pre>  47          self.query_start_loc: torch.Tensor = torch.zeros(
+  48              max_num_reqs + 2,
+  49              dtype=torch.int32,
+  50              device=device,
+  51          )
+  52  
+  53          # Create seq_lens_cpu and seq_lens_np.
+  54          # npu's attention backend still needs seq_lens on CPU side.
+  55          self.seq_lens_cpu: torch.Tensor = torch.zeros(
+  56              max_num_reqs,
+  57              dtype=torch.int32,
+  58              device=&quot;cpu&quot;,
+  59          )
+  60          # seq_len_np and seq_lens_cpu share the same memory.
+  61          # define seq_lens_np for easier calculation with numpy.
+  62          self.seq_lens_np: np.ndarray = self.seq_lens_cpu.numpy()
+  63  
+  64          # Logical query token count, scoped to _dummy_run before graph padding.
+  65          # None keeps the default layout for other dummy/capture paths.</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/input_batch.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>Ascend 输入准备：增加 seq_lens_cpu 等后端需求 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/model_runner.py:816</div><pre> 816      def _prepare_inputs_impl(
+ 817          self,
+ 818          scheduler_output: SchedulerOutput,
+ 819          batch_req_state: BatchReqState,
+ 820          batch_desc: BatchExecutionDescriptor,
+ 821      ) -&gt; AscendInputBatch:
+ 822          &quot;&quot;&quot;Shared implementation for GPUModelRunner.prepare_inputs on Ascend.
+ 823  
+ 824          npu attention backends need seq_lens_cpu to work, so we prepare
+ 825          seq_lens_cpu here.
+ 826          &quot;&quot;&quot;
+ 827          self._check_finegrained_tp_graph_step(batch_desc.cg_mode)
+ 828          num_tokens = batch_req_state.num_tokens
+ 829          num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
+ 830          graph_num_reqs = batch_desc.num_reqs
+ 831          global_graph_num_reqs = (
+ 832              self.pcp_manager.get_global_graph_num_reqs(batch_desc) if self.pcp_manager is not None else None
+ 833          )</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/model_runner.py">阅读完整文件 ↗</a></small></details><p>所以“MRV2 把长度都搬到设备，Ascend 也再不需要 CPU 长度”不成立。当前 Ascend 的部分 Attention / 投机路径仍要精确 host 长度，并有设备回传与 event 同步处理。</p><details class="source"><summary>host 长度同步的具体路径 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/model_runner.py:1329</div><pre>1329      def _update_seq_lens_cpu(
+1330          self,
+1331          scheduler_output: SchedulerOutput,
+1332          req_ids: list[str],
+1333      ):
+1334          num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+1335  
+1336          # Speculative decoding needs corrected num_computed_tokens after rejection.
+1337          # req_states.num_computed_tokens_cpu shares storage with its NumPy view,
+1338          # so this update also corrects the num_computed_tokens_np used by PCP.
+1339          if (
+1340              self.speculator is not None and not is_deepseek_v41(self.model_config.hf_config)
+1341          ) or self.sync_spec_pp_cpu_counts:
+1342              # Blocks CPU submission until D2H completes; may stall the async pipeline.
+1343              self.num_computed_tokens_event.synchronize()
+1344              for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
+1345                  req_index = self.req_states.req_id_to_index[req_id]
+1346                  self.req_states.num_computed_tokens_cpu[req_index] = self.num_computed_tokens_cpu[req_index]
+1347  
+1348          # Without a CPU consumer, retain the upstream optimistic upper bound.
+1349          # prepare_pos_seq_lens still reads exact rejection-corrected NPU state.
+1350          for i, req_id in enumerate(req_ids):  # type: ignore</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/model_runner.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">03 / 方法覆盖之外</div><h2>模块全局符号也会影响父类内部调用。</h2><p>假设父类函数调用 <code>init_model_state(...)</code>。这个名字在父类所属模块中解析；Ascend patch 改掉那个模块里的绑定，父类就会创建 Ascend ModelState，而不是原来的默认实现。同理，<code>InputBatch</code>、<code>BlockTables</code> 和部分采样 kernel 也有替换。</p><details class="source"><summary>Worker 启动时导入适配 patch · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/patch/worker/__init__.py:60</div><pre>  60  import vllm_ascend.patch.worker.patch_v2.patch_uva  # noqa
+  61  import vllm_ascend.patch.worker.patch_v2.patch_input_batch  # noqa
+  62  import vllm_ascend.patch.worker.patch_v2.patch_model_state  # noqa
+  63  import vllm_ascend.patch.worker.patch_v2.patch_block_table  # noqa
+  64  import vllm_ascend.patch.worker.patch_v2.patch_attn_utils  # noqa
+  65  import vllm_ascend.patch.worker.patch_v2.patch_model_runner  # noqa
+  66  
+  67  import vllm_ascend.patch.worker.patch_v2.patch_eagle_speculator  # noqa
+  68  import vllm_ascend.patch.worker.patch_v2.patch_dflash_speculator  # noqa
+  69  import vllm_ascend.patch.worker.patch_v2.patch_dspark  # noqa
+  70  import vllm_ascend.patch.worker.patch_v2.patch_adaptive_verification  # noqa</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/patch/worker/__init__.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>替换父类模块的工厂函数 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/patch/worker/patch_v2/patch_model_state.py:28</div><pre>  28  model_runner.init_model_state = init_asecnd_model_state
+  29  # ModelState imports the manager class into its own module namespace. Replace
+  30  # that exact binding so MRV2 constructs an NPU-aware encoder graph manager.
+  31  interface.EncoderCudaGraphManager = EncoderAclGraphManager
+  32  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/patch/worker/patch_v2/patch_model_state.py">阅读完整文件 ↗</a></small></details><div class="tablewrap"><table><tr><th>上游接点</th><th>当前 Ascend 入口</th><th>跟读理由</th></tr><tr><td>RequestState</td><td>worker/v2/states.py</td><td>请求状态的 host view 需求</td></tr><tr><td>InputBatch / prepare_inputs</td><td>worker/v2/input_batch.py、model_runner.py</td><td>CPU 长度、query padding、Attention 状态</td></tr><tr><td>init_model_state</td><td>patch_model_state.py → model_states/</td><td>模型/后端相关 metadata 与状态生命周期</td></tr><tr><td>BlockTables</td><td>patch_block_table.py → worker/v2/block_table.py</td><td>cache group、CP 等映射适配</td></tr><tr><td>ModelCudaGraphManager</td><td>ModelAclGraphManager + override_graph_manager</td><td>底层 ACL graph 管理、更新与 replay</td></tr><tr><td>采样 / UVA</td><td>patch_triton.py / patch_uva.py</td><td>相同上游符号不一定执行同一实现</td></tr></table></div></section><section class="section"><div class="sectionno">04 / 两个具体例子</div><h2>别停在“它复用了上游”这句话。</h2><h3>采样：gumbel_sample 符号被替换</h3><p>上游 MRV2 的 Python Sampler 使用 <code>gumbel_sample</code>。当前标准 Worker patch 把 <code>sampler.gumbel_sample</code> 等绑定到 Ascend 的 <code>categorical_sample</code>。因此在 NPU 上判断采样算法，要读 patch 后的实际函数，不能只看上游函数名。310P 有专门路由，也不能概括成完全相同实现。</p><details class="source"><summary>Ascend 采样替换：直接检查最终绑定 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/patch/worker/patch_v2/patch_triton.py:57</div><pre>  57  gumbel.gumbel_sample = categorical_sample
+  58  speculator.gumbel_sample = categorical_sample
+  59  base_speculator.gumbel_sample = categorical_sample
+  60  dspark_speculator.gumbel_sample = categorical_sample
+  61  sampler.gumbel_sample = categorical_sample
+  62  topk_topp_sampler.apply_top_k_top_p_triton = apply_top_k_top_p_npu
+  63  structured_outputs._apply_grammar_bitmask_kernel = _apply_grammar_bitmask_kernel
+  64  mamba_utils.precopy_mamba_align_fused_kernel = precopy_mamba_align_fused_kernel</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/patch/worker/patch_v2/patch_triton.py">阅读完整文件 ↗</a></small></details><h3>UVA：映射能力与回退都要核对</h3><p>当前 <code>UvaBufferWrapper</code> 根据环境与运行库检查尝试建立 NPU 可访问的 CPU 内存视图；不可用时使用 NPU 缓冲和异步 H2D 回退。因此上游的“UVA tensor”在 Ascend 具体是映射还是拷贝，要看实际能力与配置。</p><details class="source"><summary>真实 UVA 与异步拷贝回退的选择 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/patch/worker/patch_v2/patch_uva.py:135</div><pre> 135          requested_real_uva = is_uva_available()
+ 136          if requested_real_uva:
+ 137              import vllm_ascend.vllm_ascend_C  # type: ignore[import-untyped]  # noqa: F401
+ 138  
+ 139          view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(self._cpu) if requested_real_uva else None
+ 140          self._use_real_uva = view is not None
+ 141          if requested_real_uva and not self._use_real_uva:
+ 142              logger.warning_once(&quot;Pinned CPU memory is not mapped for NPU UVA; using the async H2D fallback&quot;)
+ 143          self._uva: torch.Tensor = view if view is not None else torch.zeros_like(self._cpu, device=&quot;npu&quot;)
+ 144  
+ 145      def _mark_cpu_modified(self, key: int):
+ 146          self._modified_indices.add(key)</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/patch/worker/patch_v2/patch_uva.py">阅读完整文件 ↗</a></small></details><h3>图：显式换成 ModelAclGraphManager</h3><p><code>override_graph_manager()</code> 暂时替换父类模块的 manager 工厂，返回 NPU 图管理器，再恢复原绑定。配置类型里仍会见到 <code>CUDAGraphMode</code> 这个名字；名称不能单独证明底层运行的是 CUDA。</p><details class="source"><summary>给上游工厂接入 ACL graph manager · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/model_runner.py:1463</div><pre>1463          return ModelAclGraphManager(
+1464              vllm_config,
+1465              device,
+1466              cudagraph_mode,
+1467              decode_query_len,
+1468              model_runner,
+1469              lora_capture_cases=lora_capture_cases,
+1470              varlen_decode=varlen_decode,
+1471              ubatch_runner=ubatch_runner,
+1472          )</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/model_runner.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">05 / 练一次适配检查</div><h2>调用方和覆盖方法，必须一起读。</h2><p>当前两份 checkout 有一个具体的接口核查点：上游 <code>execute_model</code> 调用 <code>prepare_inputs(scheduler_output, batch_req_state, batch_desc)</code>；Ascend override 还要求额外的 <code>num_active_loras</code> 参数。下面直接展示本地原文。</p><details class="source"><summary>调用方：当前只传三个显式参数 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1646</div><pre>1646              input_batch = self.prepare_inputs(
+1647                  scheduler_output, batch_req_state, batch_desc
+1648              )
+1649              block_tables, slot_mappings = self.prepare_attn(input_batch)</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>覆盖方法：多一个必需参数 · 展开真实源码</summary><div class="path">vllm-ascend/vllm_ascend/worker/v2/model_runner.py:1076</div><pre>1076      def prepare_inputs(
+1077          self,
+1078          scheduler_output: SchedulerOutput,
+1079          batch_req_state: BatchReqState,
+1080          batch_desc: BatchExecutionDescriptor,
+1081          num_active_loras: int,  # noqa: ARG002
+1082      ) -&gt; AscendInputBatch:
+1083          # vLLM #56456 added num_active_loras to prepare_inputs on main; it
+1084          # only feeds FastPrefillHelper, which this Ascend path does not use.
+1085          return self._prepare_inputs_impl(scheduler_output, batch_req_state, batch_desc)
+1086  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm-ascend/blob/363af1c27954ff1f7ae5bd66eef06da62c2e3cd0/vllm_ascend/worker/v2/model_runner.py">阅读完整文件 ↗</a></small></details><p>如果最终绑定没有其他适配，这个直接调用会缺少一个参数。这是静态看到的签名差异，尚未在 NPU 上验证；本课未修改实现。它说明：<strong>理解父类主干之外，还要核对两份 revision 的接口匹配。</strong>真实运行还应确认配置、硬件路由与 patch 生效状态。</p></section><section class="section"><div class="sectionno">06 / 检索练习</div><h2>从名字走到实际执行函数。</h2><div class="quiz" data-check data-correct="2" data-explain="查看 patch_triton 中 sampler.gumbel_sample 的最终绑定，再读对应 Ascend 实现。" data-hint="类继承不能覆盖所有适配：模块级导入名字可能被 patch 替换。"><h3>上游 Sampler 写着 gumbel_sample，想判断当前标准 Ascend MRV2 的实际采样入口，下一步查什么？</h3><div class="answers"><button data-choice="0" aria-pressed="false">模型配置的名称</button><button data-choice="1" aria-pressed="false">词表文件的大小</button><button data-choice="2" aria-pressed="false">符号替换的绑定</button></div><p class="feedback" data-feedback aria-live="polite"></p></div><p><strong>复述题：</strong>用“继承 → 方法覆盖 → 组件替换 → 模块 patch”四个词，解释为什么只读 <code>NPUModelRunner.execute_model()</code> 不够。</p><p>到这里，再回到 MRV1 与 MRV2：它们是相同引擎任务的两种执行组织方式。先能自己追一轮输入与状态变化，再进入 P/D，就有了可用的定位基础。</p></section><section class="section"><h2>把理解带回聊天</h2><p>不清楚的代码、公式和例子都可以直接问我。完成本课练习后，请用自己的话解释理由；我会据此调整下一课。页面内的回答不会自动上传，也不会直接成为掌握记录。</p><p><a href="../reference/0002-implementation-map.html">打开实现速查表 →</a></p><nav class="course-nav"><a href="../index.html">课程首页</a><a href="0002-v1-v2-state-design.html">01 · 设计差异</a><a href="0003-build-one-input.html">02 · 输入实算</a><a href="0004-execute-sample-async.html">03 · 执行与异步</a><a href="0005-ascend-integration.html" aria-current="page">04 · Ascend 适配</a></nav></section></main><footer class="footer">两份固定 checkout 的静态讲解；源码片段由本地文件直接提取。示例数值用于教学，未执行 torch / NPU 验证。功能与速度需按具体版本、模型、配置判断。</footer></body></html>

@@ -1,0 +1,118 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MRV2 · 从状态行，算到本轮模型输入。</title><link rel="stylesheet" href="../assets/course.css"><link rel="stylesheet" href="../assets/deep-course.css"><script defer src="../assets/deep-course.js"></script></head><body><nav data-course-root style="max-width:1080px;margin:0 auto;padding:14px 42px 0;font-size:13px"><a href="../../../index.html">← 推理系统源码笔记</a></nav><header><div class="topline"><span class="brand">MRV2 / 实现跟读</span><span>先理解实现 · P/D 延后</span></div><nav class="course-nav"><a href="../index.html">课程首页</a><a href="0002-v1-v2-state-design.html">01 · 设计差异</a><a href="0003-build-one-input.html" aria-current="page">02 · 输入实算</a><a href="0004-execute-sample-async.html">03 · 执行与异步</a><a href="0005-ascend-integration.html">04 · Ascend 适配</a></nav><div class="hero"><div class="eyebrow">实现课 02 / 约 12 分钟</div><h1>从状态行，<br>算到本轮模型输入。</h1><p class="lead">用一个 Prefill + Decode 混合 batch，手算 idx_mapping、query_start_loc、positions、seq_lens、input_ids 和 KV slot。</p><div class="chips"><span class="chip">vLLM a97dacb7106e</span><span class="chip">Ascend 363af1c27954</span><span class="chip">2026-10-16 · 静态源码</span></div></div></header><main><div class="reading-goal"><strong>本课首选源码：</strong><a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py#L1202">GPUModelRunner.prepare_inputs()</a> 与 <a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/input_batch.py#L327">输入 kernel</a>。先读正文理解关系，再展开源码对照。</div><section class="section"><div class="sectionno">01 / 先分索引</div><h2>四种数字，四种含义。</h2><div class="tablewrap"><table><tr><th>数字</th><th>索引谁</th><th>本例</th></tr><tr><td>req_state_idx</td><td>长期保存的请求状态行</td><td>C → 1，A → 3</td></tr><tr><td>batch_idx</td><td>本轮请求顺序</td><td>C → 0，A → 1</td></tr><tr><td>position</td><td>token 在该请求整个序列中的位置</td><td>C 的本轮 token → 5</td></tr><tr><td>KV slot</td><td>普通分页 Attention 的缓存槽</td><td>C 的本轮 token → 45</td></tr></table></div><p>它们不能互换。比如 <code>idx_mapping</code> 指向状态行，<code>block_table</code> 才把请求的逻辑块索引映射到缓存块。Attention 读取哪些历史缓存，还取决于序列长度等 metadata。</p></section><section class="section"><div class="sectionno">02 / 固定一个例子</div><h2>同一轮：C 做 Decode，A 做 Prefill。</h2><p>只讨论普通自回归生成、单个 Attention KV group、无投机、无并行、无 prefix 命中、无图 padding；kernel block size = KV block size = 4。这里的 Prefill 是请求阶段，不涉及 P/D 分离。</p><div class="tablewrap"><table><tr><th>请求</th><th>持久行</th><th>已有状态</th><th>本轮 q</th><th>block ids</th></tr><tr><td>C</td><td>1</td><td>prefill_len=3；computed=5；last_sampled=205；total_len=6</td><td>1</td><td>[10,11]</td></tr><tr><td>A</td><td>3</td><td>prefill_len=4；computed=2；all_token_ids=[101,102,103,104]</td><td>2</td><td>[20]</td></tr></table></div><p>C 的 205 已采样，但尚未作为模型输入计算 KV，所以它在 position 5。A 的 position 0、1 已算过，本轮继续输入 position 2、3。</p><details class="source"><summary>本轮请求排序：验证/Decode → 短续算 → Prefill · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:2209</div><pre>2209  def sort_batch_req_ids(
+2210      num_tokens_per_req: dict[str, int],
+2211      draft_tokens: dict[str, list[int]],
+2212      decode_query_len: int,
+2213  ) -&gt; list[str]:
+2214      # Order verification/decode -&gt; short_extend -&gt; prefill;
+2215      # split_decodes_and_prefills relies on decode-like requests leading.
+2216      key = lambda r: (
+2217          not draft_tokens.get(r),
+2218          (num := num_tokens_per_req[r]) != decode_query_len,
+2219          num,
+2220      )
+2221      return sorted(num_tokens_per_req, key=key)
+2222  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">03 / 逐步算</div><h2>从映射走到 input_ids 和 KV slot。</h2><div data-input-walk><div class="controls"><button data-walk-stage="0" aria-pressed="true">1 排序</button><button data-walk-stage="1" aria-pressed="false">2 前缀和</button><button data-walk-stage="2" aria-pressed="false">3 位置与长度</button><button data-walk-stage="3" aria-pressed="false">4 token 输入</button><button data-walk-stage="4" aria-pressed="false">5 缓存与输出行</button></div><div class="panel"><h3 data-walk-title></h3><pre data-walk-values></pre><p data-walk-explain aria-live="polite"></p></div></div><p class="small">所有数值在页面中演算，未启动模型。上述 slot 公式只用于本例的普通 Attention 缓存，不应直接套用 MLA、混合模型、CP 或特殊 cache layout。</p></section><section class="section"><div class="sectionno">04 / 对应真实代码</div><h2>CPU 描述批次，设备侧按映射取值。</h2><p><code>gather_batch_req_state()</code> 在 CPU 上排序请求，得到 <code>idx_mapping_np</code>，取出 Prefill 进度等。<code>prepare_inputs()</code> 把映射送到设备，构造 query 边界，调用设备 kernel 填本轮输入。所以 MRV2 仍有 CPU 输入准备；只是状态计算与数据移动的分工变了。</p><details class="source"><summary>从 request_id 查持久状态行 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1170</div><pre>1170          )
+1171  
+1172          numtoks_iter = map(num_tokens_per_req.__getitem__, req_ids)
+1173          num_scheduled_tokens = np.fromiter(numtoks_iter, dtype=np.int32, count=num_reqs)
+1174  
+1175          idx_mapping_iter = map(self.req_states.req_id_to_index.__getitem__, req_ids)
+1176          idx_mapping_np = np.fromiter(idx_mapping_iter, dtype=np.intp, count=num_reqs)
+1177          prefill_len_np = self.req_states.prefill_len.np[idx_mapping_np]
+1178          num_computed_prefill_tokens_np = self.req_states.num_computed_prefill_tokens[
+1179              idx_mapping_np
+1180          ]</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>query_start_loc：本轮 query 长度的前缀和 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1274</div><pre>1274          # Get query_start_loc.
+1275          # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+1276          num_reqs_padded = batch_desc.num_reqs or num_reqs
+1277          query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
+1278          query_start_loc_np[0] = 0
+1279          np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
+1280          # Pad for full CUDA graph mode.
+1281          # Some attention backends like FA3 require query_start_loc to be non-decreasing.
+1282          query_start_loc_np[num_reqs + 1 :] = num_tokens
+1283          query_start_loc = self.input_buffers.query_start_loc
+1284          async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+1285          if adaptive_verification is not None:
+1286              cu_num_logits, query_start_loc, total_num_draft_tokens = (</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>设备 kernel：state 行 → computed → positions / seq_lens · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/input_batch.py:346</div><pre> 346      req_state_idx = tl.load(idx_mapping_ptr + req_id)
+ 347      num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
+ 348  
+ 349      start = tl.load(query_start_loc_ptr + req_id)
+ 350      end = tl.load(query_start_loc_ptr + req_id + 1)
+ 351      query_len = end - start
+ 352  
+ 353      seq_len = num_computed_tokens + query_len
+ 354      tl.store(seq_lens_ptr + req_id, seq_len)
+ 355  
+ 356      for i in tl.range(0, query_len, BLOCK_SIZE):
+ 357          block = i + tl.arange(0, BLOCK_SIZE)
+ 358          mask = block &lt; query_len
+ 359          pos = num_computed_tokens + block
+ 360          tl.store(pos_ptr + start + block, pos, mask=mask)
+ 361  
+ 362  
+ 363  def prepare_pos_seq_lens(
+ 364      idx_mapping: torch.Tensor,</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/input_batch.py">阅读完整文件 ↗</a></small></details><p>上一个片段位于 <code>_prepare_pos_seq_lens_kernel</code>。实现公式：</p><div class="formula">positions[token_start + j] = computed[state_row] + j<br>seq_lens[batch_row] = computed[state_row] + query_len</div><p>再看 Prefill 的历史 token 与 Decode 的上一步采样 token 如何进入同一个 input buffer。选择 logits 行也在这段设备输入构造逻辑中完成。</p><details class="source"><summary>Prefill 输入从 all_token_ids 获取 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1298</div><pre>1298          if batch_req_state.has_prefill:
+1299              prepare_prefill_inputs(
+1300                  self.input_buffers.input_ids,
+1301                  self.req_states.next_prefill_tokens,
+1302                  idx_mapping,
+1303                  query_start_loc,
+1304                  self.req_states.all_token_ids.gpu,
+1305                  self.req_states.prefill_len.gpu,
+1306                  self.req_states.num_computed_tokens.gpu,
+1307              )
+1308  
+1309          # Prepare positions and seq_lens.
+1310          prepare_pos_seq_lens(</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>常规生成：从每个 query 的末端选 hidden-state 行 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/input_batch.py:408</div><pre> 408      # Compute the logits indices.
+ 409      block = tl.arange(0, BLOCK_SIZE)
+ 410      query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+ 411      logits_start = query_end - num_logits
+ 412      tl.store(
+ 413          logits_indices_ptr + cu_num_logits_start + block,
+ 414          logits_start + block,
+ 415          mask=block &lt; num_logits,
+ 416      )
+ 417  
+ 418      seq_len = tl.load(seq_lens_ptr + batch_idx)
+ 419      prefill_len = tl.load(prefill_len_ptr + req_state_idx)</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/input_batch.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>根据 idx_mapping gather block table，并计算 slot mapping · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1412</div><pre>1412          block_tables = self.block_tables.gather_block_tables(
+1413              input_batch.idx_mapping,
+1414              num_reqs_padded=input_batch.num_reqs_after_padding,
+1415          )
+1416          # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
+1417          # Kernel pads beyond num_tokens with PAD_SLOT_ID.
+1418          slot_mappings = self.block_tables.compute_slot_mappings(
+1419              input_batch.idx_mapping,
+1420              input_batch.query_start_loc,
+1421              input_batch.positions,
+1422              num_tokens_padded=input_batch.num_tokens_after_padding,
+1423          )
+1424          return block_tables, slot_mappings
+1425  
+1426      def prepare_dummy_attn(</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">05 / 两种状态生命周期</div><h2>InputBatch 对象会变，底层缓冲可以复用。</h2><p><code>RequestState</code> 管活跃请求的状态；<code>InputBuffers</code> 在初始化时分配 device 输入缓冲。每轮构造的 <code>InputBatch</code> 是描述本轮的对象，字段可以是这些长期缓冲的切片。因此“per-step InputBatch”并不表示每轮把所有 device tensor 重新分配一遍。</p><details class="source"><summary>长期存在的输入缓冲 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/input_batch.py:17</div><pre>  17  class InputBuffers:
+  18      def __init__(
+  19          self,
+  20          max_num_reqs: int,
+  21          max_num_tokens: int,
+  22          device: torch.device,
+  23      ):
+  24          self.max_num_reqs = max_num_reqs
+  25          self.max_num_tokens = max_num_tokens
+  26          self.device = device
+  27  
+  28          self.input_ids = torch.zeros(max_num_tokens, dtype=torch.int32, device=device)
+  29          self.positions = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
+  30          self.is_padding = torch.zeros(max_num_tokens, dtype=torch.bool, device=device)
+  31          self.query_start_loc = torch.zeros(
+  32              max_num_reqs + 1, dtype=torch.int32, device=device
+  33          )
+  34          self.seq_lens = torch.zeros(max_num_reqs, dtype=torch.int32, device=device)
+  35          # DCP: per-request local seq_lens buffer
+  36          self.dcp_local_seq_lens = torch.zeros(
+  37              max_num_reqs, dtype=torch.int32, device=device
+  38          )
+  39  
+  40  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/input_batch.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>本轮 InputBatch 引用缓冲的切片 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1385</div><pre>1385              input_ids=self.input_buffers.input_ids[:num_tokens_after_padding],
+1386              positions=self.input_buffers.positions[:num_tokens_after_padding],
+1387              is_padding=self.input_buffers.is_padding[:num_tokens_after_padding],
+1388              logits_indices=logits_indices,
+1389              cu_num_logits=cu_num_logits,</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><div class="note"><p>prompt_len 是用户 prompt 长度；prefill_len 是交给 runner 的已有输入序列长度，抢占恢复时可能包含已有输出。num_computed_tokens 的设备值用于设备执行；其 CPU mirror 在某些路径是乐观上界，不能一律当成逐步精确相等。</p></div></section><section class="section"><div class="sectionno">06 / 手算练习</div><h2>把请求顺序真正用起来。</h2><div class="quiz" data-check data-correct="2" data-explain="边界从 0 开始，对 [1,2] 累加，得到 [0,1,3]。" data-hint="query_start_loc 保存每个请求本轮 query 的累计边界，不是它的 state index 或 seq_len。"><h3>本例 req_ids=[C,A]、本轮长度=[1,2]，query_start_loc 是？</h3><div class="answers"><button data-choice="0" aria-pressed="false">[0,2,3]</button><button data-choice="1" aria-pressed="false">[1,2,3]</button><button data-choice="2" aria-pressed="false">[0,1,3]</button></div><p class="feedback" data-feedback aria-live="polite"></p></div><div class="quiz" data-check data-correct="0" data-explain="5 个已有位置 + 本轮 1 个位置，共 6。positions 中对应的本轮位置是 5。" data-hint="position 从 0 计数；seq_len 是长度。分清一个 token 的位置与序列总长度。"><h3>C 已计算 5 个 token，本轮再输入 1 个 token，本轮 C 的 seq_len 是？</h3><div class="answers"><button data-choice="0" aria-pressed="false">6</button><button data-choice="1" aria-pressed="false">5</button><button data-choice="2" aria-pressed="false">1</button></div><p class="feedback" data-feedback aria-live="polite"></p></div><p><strong>复述题：</strong>说明为什么本轮 <code>input_ids</code> 是 <code>[205,103,104]</code>，而不是本轮尚未采样的新 token。</p><p><a href="0004-execute-sample-async.html">下一课：这些输入如何执行、采样并回写 →</a></p></section><section class="section"><h2>把理解带回聊天</h2><p>不清楚的代码、公式和例子都可以直接问我。完成本课练习后，请用自己的话解释理由；我会据此调整下一课。页面内的回答不会自动上传，也不会直接成为掌握记录。</p><p><a href="../reference/0002-implementation-map.html">打开实现速查表 →</a></p><nav class="course-nav"><a href="../index.html">课程首页</a><a href="0002-v1-v2-state-design.html">01 · 设计差异</a><a href="0003-build-one-input.html" aria-current="page">02 · 输入实算</a><a href="0004-execute-sample-async.html">03 · 执行与异步</a><a href="0005-ascend-integration.html">04 · Ascend 适配</a></nav></section></main><footer class="footer">两份固定 checkout 的静态讲解；源码片段由本地文件直接提取。示例数值用于教学，未执行 torch / NPU 验证。功能与速度需按具体版本、模型、配置判断。</footer></body></html>

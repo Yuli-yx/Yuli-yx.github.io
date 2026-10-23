@@ -1,0 +1,20 @@
+{
+  "title": "vLLM-Ascend 源码课程",
+  "savedAt": "2026-10-23",
+  "currentLesson": "04",
+  "scope": "从一次请求的执行，读到 Ascend 实现、并行与问题定位",
+  "chapters": [
+    {"id":"01","phase":"引擎与请求","title":"全局架构：vLLM 与 Ascend 插件","status":"planned","goal":"能画出 API、Engine、Scheduler、Executor、Worker、Runner、模型与算子的职责图。","topics":["代码仓库与模块边界","请求执行总链","平台注册、模型注册、patch 与实际绑定"],"exercise":"对一个函数或日志，指出它属于哪一层以及应跳到哪里继续读。"},
+    {"id":"02","phase":"引擎与请求","title":"一次请求：从输入到流式输出","status":"planned","goal":"能跟读一个请求的 Prefill、Decode、采样、终止和结果返回。","topics":["token 与序列位置","单步推理和多轮生成","请求状态与流式输出"],"exercise":"按时间顺序解释一个 token 何时被采样、何时作为输入、何时产生 KV。"},
+    {"id":"03","phase":"引擎与请求","title":"Scheduler 与 KV cache 管理","status":"planned","goal":"能解释本轮 token 预算、block 分配与请求调度状态。","topics":["调度结果与 runner 的接口","分页缓存、prefix cache 与引用关系","chunked prefill、抢占与恢复"],"exercise":"给定请求长度和可用 blocks，推演两轮调度与缓存状态变化。"},
+    {"id":"04","phase":"执行实现","title":"Model Runner：MRV1 与 MRV2","status":"ready","goal":"能从持久请求状态跟到本轮输入、模型执行、采样回写及 Ascend 适配。","path":"modules/04-model-runner/index.html","entry":"modules/04-model-runner/lessons/0002-v1-v2-state-design.html","topics":["状态与 batch 解耦、idx_mapping","输入手算：positions、seq_lens、KV slot","execute/sample、异步、staged writes、图管理","Ascend 的继承、覆盖、组件与 patch"],"exercise":"用 C/A 混合 batch 手算输入，并解释 batch 换序时哪些状态变化。","units":[{"title":"MRV1 → MRV2：状态与 batch 解耦","path":"modules/04-model-runner/lessons/0002-v1-v2-state-design.html"},{"title":"从状态行算到本轮输入","path":"modules/04-model-runner/lessons/0003-build-one-input.html"},{"title":"执行、采样、回写与异步","path":"modules/04-model-runner/lessons/0004-execute-sample-async.html"},{"title":"Ascend 的实际适配路径","path":"modules/04-model-runner/lessons/0005-ascend-integration.html"}]},
+    {"id":"05","phase":"执行实现","title":"Attention、模型状态与缓存布局","status":"planned","goal":"能区分逻辑状态、物理张量布局和 Attention metadata，定位模型之间的差异。","topics":["MHA、GQA、MLA 的阅读方法","block table、slot mapping、shape 与 stride","混合模型、模型专用状态与 cache contract"],"exercise":"从一个具体模型的 cache spec，追到分配、视图和 Attention 读写。"},
+    {"id":"06","phase":"执行实现","title":"Ascend 运行时、算子与图执行","status":"planned","goal":"能把模型代码中的计算映射到 torch_npu、设备算子、stream 与图执行路径。","topics":["设备与 host 状态、stream 和 event","自定义算子、融合算子与依赖关系","eager、编译、图捕获和 replay 的代码边界"],"exercise":"解释一个 host/device 同步点，或沿一次图执行找到输入与 metadata 更新。"},
+    {"id":"07","phase":"扩展与协同","title":"并行：TP、DP、EP、PP 与 CP","status":"planned","goal":"能区分各并行维度的切分对象、rank 拓扑与通信职责。","topics":["权重、请求、专家和流水段的分工","通信组与 collective 的阅读方法","PCP/DCP、KV 分片及 rank 对齐"],"exercise":"为一个明确拓扑画出每个 rank 的数据与通信边界。"},
+    {"id":"08","phase":"扩展与协同","title":"模型接入、量化与投机解码","status":"planned","goal":"能定位模型注册、权重加载、量化和多 token 生成对执行契约的影响。","topics":["模型实现与权重映射","量化 tensor 的 dtype、scale 与算子接口","draft、target、验证与状态回滚"],"exercise":"选定一个模型，追一次额外状态或量化参数从配置进入算子的路径。"},
+    {"id":"09","phase":"扩展与协同","title":"P/D 分离与 KV Connector","status":"planned","deferred":true,"goal":"能沿调度信息、实际 KV 数据和完成回报定位 P/D 流程。","topics":["P、D 两边的请求和缓存生命周期","connector scheduler/worker 与 metadata","Mooncake 传输、异步完成及资源释放"],"exercise":"沿一个 request_id 还原 P → D 的数据与回报闭环，指出等待发生的位置。"},
+    {"id":"10","phase":"验证与定位","title":"性能、正确性与 Profiling","status":"planned","goal":"能设计可比较的测试，并将指标和 trace 对应到具体执行阶段。","topics":["TTFT、TPOT、吞吐与并发的关系","基线、warmup、采样与准确性验证","算子、通信、空隙与 HBM 的分析入口"],"exercise":"提出一组受控对照，用证据判断一次实现改动影响哪段开销。"},
+    {"id":"11","phase":"验证与定位","title":"故障定位：卡住、失败与精度异常","status":"planned","goal":"能固定现场版本与拓扑，定位首个异常边界并形成最小验证。","topics":["加载、初始化、前向、通信与回收分层","日志、堆栈、trace 与请求关联","可复现输入、对照实验与根因证据"],"exercise":"从一个真实案例区分已证实事实、待验证假设和下一步检查点。"},
+    {"id":"12","phase":"验证与定位","title":"开发实践：上游适配、测试与 CI","status":"planned","goal":"能把理解转成可审阅的代码改动，并说明验证覆盖与边界。","topics":["源码配对、接口演进和 patch 生命周期","UT、硬件验证、精度与性能回归","PR、CI 证据与运行结论的边界"],"exercise":"针对一处改动写出问题、实现、兼容性影响和必要验证。"}
+  ]
+}

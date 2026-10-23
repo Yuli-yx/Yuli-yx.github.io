@@ -1,0 +1,238 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MRV2 · 执行、采样、回写，再看异步为何成立。</title><link rel="stylesheet" href="../assets/course.css"><link rel="stylesheet" href="../assets/deep-course.css"><script defer src="../assets/deep-course.js"></script></head><body><nav data-course-root style="max-width:1080px;margin:0 auto;padding:14px 42px 0;font-size:13px"><a href="../../../index.html">← 推理系统源码笔记</a></nav><header><div class="topline"><span class="brand">MRV2 / 实现跟读</span><span>先理解实现 · P/D 延后</span></div><nav class="course-nav"><a href="../index.html">课程首页</a><a href="0002-v1-v2-state-design.html">01 · 设计差异</a><a href="0003-build-one-input.html">02 · 输入实算</a><a href="0004-execute-sample-async.html" aria-current="page">03 · 执行与异步</a><a href="0005-ascend-integration.html">04 · Ascend 适配</a></nav><div class="hero"><div class="eyebrow">实现课 03 / 约 12 分钟</div><h1>执行、采样、回写，<br>再看异步为何成立。</h1><p class="lead">把一轮模型执行分成可追踪的阶段，解释 token 怎样成为下一轮输入，以及 MRV2 如何组织状态更新与异步工作。</p><div class="chips"><span class="chip">vLLM a97dacb7106e</span><span class="chip">Ascend 363af1c27954</span><span class="chip">2026-10-16 · 静态源码</span></div></div></header><main><div class="reading-goal"><strong>本课首选源码：</strong><a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py#L1563">execute_model()</a> 与 <a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py#L1896">sample_tokens()</a>。先读正文理解关系，再展开源码对照。</div><section class="section"><div class="sectionno">01 / 分清三段</div><h2>execute_model 不等于“生成结果已经到 CPU”。</h2><div class="step-chain"><code>execute_model</code>：更新请求 → 选择执行描述 → prepare_inputs → prepare_attn / ModelState → model 或 graph → ExecuteModelState<br><code>sample_tokens</code>：取出状态 → compute_logits / sampling → AsyncOutput → postprocess_sampled<br><code>get_output</code>：等待所需输出拷贝完成，整理回传结果</div><p>这是常规生成主线；PP、pooling、空 batch、投机解码有额外分支。当前 MRV1 同样把 <code>execute_model()</code> 与 <code>sample_tokens()</code> 分开，因此“分开采样”本身不能作为新旧 runner 的辨别标准。</p><details class="source"><summary>MRV2：真实执行先更新状态 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1573</div><pre>1573          if not dummy_run:
+1574              # Update the request states.
+1575              self.update_pp_decode_requests()
+1576              self.finish_requests(scheduler_output)
+1577              self.free_states(scheduler_output)
+1578              self.add_requests(scheduler_output)
+1579              self.update_requests(scheduler_output)
+1580              self.block_tables.apply_staged_writes()
+1581              if scheduler_output.total_num_scheduled_tokens == 0:
+1582                  # No need to run the model.
+1583                  empty_output = self.kv_connector.no_forward(scheduler_output)
+1584                  return self._merge_ec_connector_no_forward(
+1585                      scheduler_output, empty_output
+1586                  )
+1587  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>前向后暂存本轮执行状态 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1872</div><pre>1872          self.execute_model_state = ExecuteModelState(
+1873              input_batch=input_batch,
+1874              attn_metadata=attn_metadata,
+1875              slot_mappings_by_layer=slot_mappings_by_layer,
+1876              hidden_states=hidden_states,
+1877              aux_hidden_states=aux_hidden_states,
+1878              dp_sync=dp_sync,
+1879              finished_req_ids=finished_req_ids,
+1880              ec_connector_output=ec_connector_output,
+1881              routed_experts=routed_experts,
+1882              cudagraph_stats=cudagraph_stats,
+1883          )
+1884  
+1885          if not self.is_last_pp_rank:
+1886              # Non-last PP rank: return IntermediateTensors for sending.
+1887              assert output_intermediate_tensors is not None
+1888              assert self.pp_handler is not None
+1889              return self.pp_handler.relay_aux_hidden_states(</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>采样阶段消费 ExecuteModelState · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1896</div><pre>1896      def sample_tokens(
+1897          self, grammar_output: GrammarOutput | None
+1898      ) -&gt; AsyncOutput | ModelRunnerOutput | None:
+1899          if self.execute_model_state is None:
+1900              # The prior execute_model call must have failed.
+1901              return None
+1902  
+1903          input_batch = self.execute_model_state.input_batch
+1904          attn_metadata = self.execute_model_state.attn_metadata
+1905          slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
+1906          hidden_states = self.execute_model_state.hidden_states
+1907          aux_hidden_states = self.execute_model_state.aux_hidden_states
+1908          dp_sync = self.execute_model_state.dp_sync
+1909          finished_req_ids = self.execute_model_state.finished_req_ids
+1910          ec_connector_output = self.execute_model_state.ec_connector_output
+1911          routed_experts = self.execute_model_state.routed_experts
+1912          cudagraph_stats = self.execute_model_state.cudagraph_stats
+1913          self.execute_model_state = None
+1914  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">02 / 模块的边界</div><h2>RequestState、ModelState 和 nn.Module 不一样。</h2><table><tr><th>组件</th><th>负责什么</th><th>不应该混成什么</th></tr><tr><td>RequestState</td><td>请求索引、token 历史、computed、last_sampled 等公共状态</td><td>不等于模型权重</td></tr><tr><td>ModelState</td><td>模型相关的输入、Attention metadata、预处理/后处理生命周期</td><td>不是每一层 Attention 算子本身</td></tr><tr><td>self.model</td><td>真正的模型 nn.Module；前向给出 hidden states 等</td><td>前向输出通常不是最终 token id</td></tr><tr><td>Sampler</td><td>从 logits 应用规则并产生采样结果</td><td>不负责调度下一轮算谁</td></tr></table><p><code>prepare_attn()</code> 先 gather block tables 并计算 slot mapping；<code>model_state.prepare_attn()</code> 进一步按模型/后端构造 metadata。混合模型可以通过 <code>preprocess_state/postprocess_state</code> 处理额外的状态演化。</p><details class="source"><summary>ModelState：前后处理的公共接口 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_states/interface.py:138</div><pre> 138      def preprocess_state(
+ 139          self,
+ 140          input_batch: InputBatch,
+ 141          block_tables: tuple[torch.Tensor, ...],
+ 142          kv_cache_config: KVCacheConfig,
+ 143          num_computed_tokens: torch.Tensor,
+ 144      ) -&gt; None:
+ 145          &quot;&quot;&quot;Hook run on real batches before the forward pass (after block tables
+ 146          are gathered). Used by mamba &quot;align&quot; prefix caching to pre-copy state
+ 147          across block boundaries. No-op by default.&quot;&quot;&quot;
+ 148          return None
+ 149  
+ 150      def postprocess_state(
+ 151          self,
+ 152          idx_mapping: torch.Tensor,
+ 153          num_sampled: torch.Tensor,
+ 154          num_computed_tokens: torch.Tensor | None = None,
+ 155      ) -&gt; None:
+ 156          return None
+ 157  
+ 158      @abstractmethod</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_states/interface.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">03 / 一次采样的实现</div><h2>hidden state → logits → token → 状态回写。</h2><p>普通生成没有额外 draft logits 时，<code>logits_indices</code> 挑出各请求应采样的 hidden-state 行；<code>compute_logits()</code> 把 hidden states 投影到词表。Sampler 再处理温度、约束、惩罚、top-k/top-p 等，选择 token。投机路径则可能一个请求对应多个 logits 行，用 <code>expanded_idx_mapping</code> 关联请求状态。</p><details class="source"><summary>普通/分片 logits 的分支 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1462</div><pre>1462              local_logits = self.model.compute_logits_local(sample_hidden_states)
+1463              logits = all_to_all_logits(local_logits, shard_metadata)
+1464              logits = logits[:, : self.vocab_size]
+1465          else:
+1466              sample_hidden_states = hidden_states[input_batch.logits_indices]
+1467              logits = self.model.compute_logits(sample_hidden_states)
+1468  
+1469          if grammar_output is not None:
+1470              # Apply grammar bitmask to the logits in-place.
+1471              assert self.structured_outputs_worker is not None
+1472              self.structured_outputs_worker.apply_grammar_bitmask(
+1473                  logits,
+1474                  input_batch,</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>Sampler.sample：映射随采样参数一起传入 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/sample/sampler.py:276</div><pre> 276      def sample(
+ 277          self,
+ 278          logits: torch.Tensor,
+ 279          expanded_idx_mapping: torch.Tensor,
+ 280          idx_mapping: torch.Tensor,
+ 281          idx_mapping_np: np.ndarray,
+ 282          pos: torch.Tensor,
+ 283          input_ids: torch.Tensor,
+ 284          expanded_local_pos: torch.Tensor,
+ 285          return_logprobs: bool = False,
+ 286      ) -&gt; tuple[torch.Tensor, torch.Tensor]:
+ 287          processed_logits = self.apply_sampling_params(
+ 288              logits,
+ 289              expanded_idx_mapping,
+ 290              idx_mapping,
+ 291              idx_mapping_np,
+ 292              pos,
+ 293              input_ids,
+ 294              expanded_local_pos,</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/sample/sampler.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>上游采样：FlashInfer 或过滤后的 Gumbel 路径 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/sample/sampler.py:311</div><pre> 311          if use_flashinfer:
+ 312              sampled = flashinfer_sample(processed_logits, top_k, top_p).to(torch.int64)
+ 313          else:
+ 314              processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
+ 315              sampled = gumbel_sample(
+ 316                  processed_logits,
+ 317                  expanded_idx_mapping,
+ 318                  self.sampling_states.temperature.gpu,
+ 319                  self.sampling_states.seeds.gpu,
+ 320                  pos,
+ 321                  apply_temperature=False,
+ 322                  is_drafting=False,
+ 323                  use_fp64=self.use_fp64_gumbel,
+ 324              )
+ 325          return sampled, processed_logits
+ 326  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/sample/sampler.py">阅读完整文件 ↗</a></small></details><p>在上游 Gumbel 路径中，可理解为对处理后的 logits 加 Gumbel 噪声再选最大项，实现相应分类分布的采样；不是先把所有概率搬回 CPU 再抽样。但当前 Ascend 会替换这个符号，下一课要继续读 patch。</p><p>采样后，通过 <code>idx_mapping</code> 把结果写回持久状态行：更新 <code>last_sampled_tokens</code>、token 历史、total_len 和 computed。注意：采样出新 token，不代表它的 KV 已经被算过。</p><details class="source"><summary>runner 将状态和结果交给 post_update · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1522</div><pre>1522      def postprocess_sampled(
+1523          self,
+1524          idx_mapping: torch.Tensor,  # May include -1 for masked entries
+1525          sampled_tokens: torch.Tensor,
+1526          num_sampled: torch.Tensor,
+1527          num_rejected: torch.Tensor,
+1528          query_start_loc: torch.Tensor | None = None,
+1529      ) -&gt; None:
+1530          # Update the number of computed tokens.
+1531          if self.is_last_pp_rank:
+1532              assert self.sampler is not None
+1533              output_bin_counts = self.sampler.penalties_state.output_bin_counts
+1534          else:
+1535              output_bin_counts = None
+1536          post_update(
+1537              idx_mapping,
+1538              self.req_states.num_computed_tokens.gpu,
+1539              self.req_states.last_sampled_tokens,
+1540              output_bin_counts,
+1541              sampled_tokens,
+1542              num_sampled,
+1543              num_rejected,
+1544              query_start_loc,
+1545              self.req_states.all_token_ids.gpu,
+1546              self.req_states.total_len.gpu,
+1547          )
+1548  
+1549          self.model_state.postprocess_state(
+1550              idx_mapping, num_sampled, self.req_states.num_computed_tokens.gpu
+1551          )
+1552  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>computed 增量考虑投机拒绝 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/input_batch.py:594</div><pre> 594      computed_delta = query_len - num_rejected
+ 595      if computed_delta != 0:
+ 596          num_computed = tl.load(num_computed_tokens_ptr + req_state_idx)
+ 597          tl.store(num_computed_tokens_ptr + req_state_idx, num_computed + computed_delta)
+ 598  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/input_batch.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">04 / 用数字验证</div><h2>接上上一课：采样完，哪几个长度变了？</h2><p>假设 C 本轮从 205 生成 206；A 完成 prompt 后生成 105；都采样 1 个 token，无拒绝。C 的 computed 从 5 变 6，total_len 从 6 变 7，last_sampled 变 206。A 的 computed 从 2 变 4，total_len 从 4 变 5，last_sampled 变 105。</p><pre>C: 已计算 [0..5]，新采样 206 位于 position 6，尚未计算它的 KV。
+A: 已计算 [0..3]，新采样 105 位于 position 4，尚未计算它的 KV。
+下一轮普通 Decode：两者把 last_sampled_tokens 当作输入。</pre><div class="note"><p>这就是 computed 和 total_len 分开的理由。本例里 total_len 比 computed 多 1；不能把这个关系推广成所有 chunked-prefill、投机或特殊模型路径的恒等式。</p></div></section><section class="section"><div class="sectionno">05 / Async-first 的具体含义</div><h2>先保住缓冲所有权，再讨论重叠。</h2><p>CPU 可以准备后续步骤，同时设备继续执行已排入 stream 的工作。隐患是 CPU 覆盖一块 pinned host buffer 时，上一轮 H2D 或 UVA 读取可能还没结束。</p><div class="timeline"><span>CPU</span><p>更新状态 N → 提交设备工作 → 准备 N+1</p><span>GPU</span><p>按 stream 顺序：输入准备 N → 前向 N → 采样 N → 状态回写 N</p></div><p><strong>MRV1：</strong><code>synchronize_input_prep()</code> 使用 event 保护可复用 CPU 张量，减少写入与在途传输的竞争。<strong>MRV2：</strong>把可变 CPU 状态与在途 snapshot 分开；小数组异步拷贝、UVA 轮转 buffer 和 staged writes 等共同支撑这个设计。</p><details class="source"><summary>MRV1：复用缓冲前等待 event · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu_model_runner.py:3928</div><pre>3928      def synchronize_input_prep(self):
+3929          if self.prepare_inputs_event is None:
+3930              yield
+3931              return
+3932  
+3933          # Ensure prior step has finished with reused CPU tensors.
+3934          # This is required in the async scheduling case because
+3935          # the CPU-&gt;GPU transfer happens async.
+3936          self.prepare_inputs_event.synchronize()
+3937          try:
+3938              yield
+3939          finally:
+3940              self.prepare_inputs_event.record()
+3941  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu_model_runner.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>MRV2：非 pinned 的权威 CPU 状态 + 独立 buffer pool · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/buffer_utils.py:91</div><pre>  91  class UvaBackedTensor:
+  92      def __init__(
+  93          self,
+  94          size: int | Sequence[int],
+  95          dtype: torch.dtype,
+  96          max_concurrency: int | None = None,
+  97      ):
+  98          self.dtype = dtype
+  99  
+ 100          # Source of truth
+ 101          self.cpu = torch.zeros(size, dtype=dtype, device=&quot;cpu&quot;, pin_memory=False)
+ 102          self.np = self.cpu.numpy()
+ 103  
+ 104          # Buffers for concurrency
+ 105          self.pool = UvaBufferPool(size, dtype, max_concurrency)
+ 106          self.gpu = self.pool.copy_to_uva(self.np)
+ 107  
+ 108      def copy_to_uva(self, n: int | None = None) -&gt; torch.Tensor:
+ 109          # CPU-to-CPU copy
+ 110          self.gpu = self.pool.copy_to_uva(self.np[:n] if n is not None else self.np)
+ 111          return self.gpu
+ 112  </pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/buffer_utils.py">阅读完整文件 ↗</a></small></details><details class="source"><summary>StagedWriteTensor：把暂存差量交给设备 kernel · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/buffer_utils.py:174</div><pre> 174      def apply_write(self) -&gt; None:
+ 175          n = len(self._staged_write_indices)
+ 176          if n == 0:
+ 177              return
+ 178  
+ 179          indices_uva = self.write_indices.copy_to_uva(self._staged_write_indices)
+ 180          starts_uva = self.write_starts.copy_to_uva(self._staged_write_starts)
+ 181          cu_lens_uva = self.write_cu_lens.copy_to_uva(self._staged_write_cu_lens)
+ 182  
+ 183          # Special handling for write_contents
+ 184          write_contents = async_tensor_h2d(
+ 185              self._staged_write_contents, device=self.device, dtype=self.dtype
+ 186          )
+ 187  
+ 188          # Write diffs to the GPU buffer
+ 189          _apply_write_kernel[(n,)](
+ 190              self.gpu,
+ 191              self.gpu.stride(0),
+ 192              indices_uva,
+ 193              starts_uva,
+ 194              write_contents,
+ 195              cu_lens_uva,
+ 196              None,
+ 197              BLOCK_SIZE=1024,
+ 198              MULTI_GROUP=False,
+ 199          )
+ 200          # Clear the staged writes
+ 201          self.clear_staged_writes()
+ 202  
+ 203      def clear_staged_writes(self) -&gt; None:</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/buffer_utils.py">阅读完整文件 ↗</a></small></details><p><code>StagedWriteTensor</code> 不是“每轮拷整张表”：先在 CPU 记下行、起点和内容，<code>apply_write()</code> 打包差量，设备 kernel 写入基张量。UVA 是设备可访问 host 内存的路径；它不代表所有状态都驻留显存。</p><p><code>AsyncOutput</code> 允许输出拷贝与后续工作重叠；取结果时仍有完成条件。Async-first 是组织原则，不意味着任意功能分支都不存在同步点。</p><details class="source"><summary>输出对象独立管理异步拷贝与取回 · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/async_utils.py:115</div><pre> 115  class AsyncOutput(AsyncModelRunnerOutput):
+ 116      def __init__(
+ 117          self,
+ 118          model_runner_output: ModelRunnerOutput,
+ 119          sampler_output: SamplerOutput,
+ 120          num_sampled_tokens: torch.Tensor,
+ 121          main_stream: torch.cuda.Stream,
+ 122          copy_stream: torch.cuda.Stream,
+ 123          check_ep_fault: bool = False,
+ 124          routed_experts: RoutedExpertsTensors | None = None,
+ 125      ):
+ 126          # NOTE(woosuk): We must retain references to the GPU tensors,
+ 127          # as the copy operations are performed on a different CUDA stream than
+ 128          # the one where the tensors were created.
+ 129          self.model_runner_output = model_runner_output
+ 130          self.sampler_output = sampler_output
+ 131          self.num_sampled_tokens = num_sampled_tokens</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/async_utils.py">阅读完整文件 ↗</a></small></details></section><section class="section"><div class="sectionno">06 / 图执行</div><h2>复用执行形状，还需要准备本轮数据。</h2><p>MRV2 显式使用 GraphManager：FULL 路径回放已捕获的图，eager 路径直接调用模型，PIECEWISE 路径由专门的图接口处理。长期 input buffers 为稳定地址提供基础，batch descriptor 决定执行/填充形状。</p><details class="source"><summary>本轮前向选择 FULL graph replay · 展开真实源码</summary><div class="path">vllm/vllm/v1/worker/gpu/model_runner.py:1804</div><pre>1804          if batch_desc.cg_mode == CUDAGraphMode.FULL:
+1805              # Use explicit cudagraph replay for FULL mode.
+1806              # NOTE(woosuk): Here, we don't need to pass the input tensors,
+1807              # because they are already copied to the CUDA graph input buffers.
+1808              assert self.cudagraph_manager is not None
+1809              self.kv_connector.pre_forward(scheduler_output)
+1810              model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+1811          else:
+1812              # For piecewise and eager mode, just call model().</pre><small>来自本地固定快照，行号为原文件行号。<a href="https://github.com/Yuli-yx/vllm/blob/a97dacb7106ee49f39f3d1fc6ae1800ff724e01d/vllm/v1/worker/gpu/model_runner.py">阅读完整文件 ↗</a></small></details><p>源码中存在多个 FULL 分支；阅读时重点找 <code>run_fullgraph()</code> 调用。图回放不表示 Python 的所有准备逻辑都重新在图内运行：本轮输入和 metadata 的准备、更新与 padding 仍要对齐。MRV1 也支持 graph；这里强调 MRV2 的显式管理结构。</p></section><section class="section"><div class="sectionno">07 / 检索练习</div><h2>新采样的 token，有没有 KV？</h2><div class="quiz" data-check data-correct="1" data-explain="computed 增加本轮已执行的 query 长度 1；total_len 增加新采样 token 数 1。新 token 的 KV 留给下一轮计算。" data-hint="分别数“模型已经执行的位置”和“已经存在的 token 历史”；采样不是前向。"><h3>上一课 C computed=5、total_len=6。本轮计算 1 个 token，采样 1 个，无拒绝。computed 与 total_len 变成？</h3><div class="answers"><button data-choice="0" aria-pressed="false">[7,7]</button><button data-choice="1" aria-pressed="false">[6,7]</button><button data-choice="2" aria-pressed="false">[6,6]</button></div><p class="feedback" data-feedback aria-live="polite"></p></div><p><strong>复述题：</strong>为什么 <code>non_blocking=True</code> 本身不能保证 host buffer 没有竞争？请说清谁在读、谁在写、是否还是同一块内存。</p><p><a href="0005-ascend-integration.html">下一课：把上游路径映射到 Ascend →</a></p></section><section class="section"><h2>把理解带回聊天</h2><p>不清楚的代码、公式和例子都可以直接问我。完成本课练习后，请用自己的话解释理由；我会据此调整下一课。页面内的回答不会自动上传，也不会直接成为掌握记录。</p><p><a href="../reference/0002-implementation-map.html">打开实现速查表 →</a></p><nav class="course-nav"><a href="../index.html">课程首页</a><a href="0002-v1-v2-state-design.html">01 · 设计差异</a><a href="0003-build-one-input.html">02 · 输入实算</a><a href="0004-execute-sample-async.html" aria-current="page">03 · 执行与异步</a><a href="0005-ascend-integration.html">04 · Ascend 适配</a></nav></section></main><footer class="footer">两份固定 checkout 的静态讲解；源码片段由本地文件直接提取。示例数值用于教学，未执行 torch / NPU 验证。功能与速度需按具体版本、模型、配置判断。</footer></body></html>
