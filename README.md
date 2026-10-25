@@ -6,7 +6,8 @@ Yuli-yx 的个人学习网站：vLLM、vLLM-Ascend、MRV2、KV cache。
 
 ## 当前主页
 
-主页为书籍式 KV cache 源码读本第一章，包含左侧目录、源码摘录和 token/block/slot 交互演算。
+主页为推理系统专题总览，包含 KV Cache 管理、P/D 分离、KV Pool 池化、PCP/DCP 与 Model Runner。
+KV Cache 第一章位于 `/kv-cache.html`，保留左侧章节目录、源码摘录和 token/block/slot 交互演算；其他新专题明确标注为规划中。
 正文与交互源文件位于 `content/book/`；修改后运行 `npm run build` 和 `npm run check`。
 `content/book/sources.json` 记录本章固定版本的源码证据。
 原文章索引保留在 `/articles.html`，原文章与课程 URL 继续可访问。

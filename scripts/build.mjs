@@ -32,9 +32,11 @@ console.log('Built static site: 6 reading entries, 2 KV articles, MRV2 archive a
 
 // Publish the source-reading book as the homepage; retain the article index.
 fs.copyFileSync(path.join(out, 'index.html'), path.join(out, 'articles.html'));
-fs.copyFileSync(path.join(root, 'content/book/index.html'), path.join(out, 'index.html'));
+for (const page of ['index.html', 'kv-cache.html']) {
+  fs.copyFileSync(path.join(root, 'content/book', page), path.join(out, page));
+}
 fs.mkdirSync(path.join(out, 'assets/book'), { recursive: true });
 for (const file of ['styles.css', 'app.js', 'sources.json']) {
   fs.copyFileSync(path.join(root, 'content/book', file), path.join(out, 'assets/book', file));
 }
-console.log('Published book chapter 1 as homepage; original index retained at articles.html.');
+console.log('Published topic homepage and KV cache chapter; original index retained at articles.html.');
