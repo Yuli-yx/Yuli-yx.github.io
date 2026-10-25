@@ -29,3 +29,12 @@ write('about.html',head('关于')+`<main class="wrap"><div class="hero"><div cla
 write('404.html',head('页面未找到')+'<main class="wrap"><h1>页面未找到</h1><p>文章路径可能已调整。请回到索引查找对应主题。</p><p><a href="/">回到文章索引 →</a></p></main>'+foot(''));
 write('.nojekyll','');write('THIRD_PARTY_NOTICES.txt',fs.readFileSync(path.join(root,'THIRD_PARTY_NOTICES.txt'),'utf8'));fs.cpSync(path.join(root,'licenses'),path.join(out,'licenses'),{recursive:true});
 console.log('Built static site: 6 reading entries, 2 KV articles, MRV2 archive and roadmap.');
+
+// Publish the source-reading book as the homepage; retain the article index.
+fs.copyFileSync(path.join(out, 'index.html'), path.join(out, 'articles.html'));
+fs.copyFileSync(path.join(root, 'content/book/index.html'), path.join(out, 'index.html'));
+fs.mkdirSync(path.join(out, 'assets/book'), { recursive: true });
+for (const file of ['styles.css', 'app.js', 'sources.json']) {
+  fs.copyFileSync(path.join(root, 'content/book', file), path.join(out, 'assets/book', file));
+}
+console.log('Published book chapter 1 as homepage; original index retained at articles.html.');

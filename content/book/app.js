@@ -1,0 +1,19 @@
+const phases=[{positions:[0,1,2,3,4,5],blocks:[5,2],before:0,after:6,note:'本轮按需分配物理 block 5 和 2。物理 block 2 的后两槽仍未写入。'},{positions:[6,7,8,9],blocks:[5,2,7],before:6,after:10,note:'新增物理 block 7。先填入 block 2 的剩余两槽，再写入 block 7 的前两槽。'},{positions:[10],blocks:[5,2,7],before:10,after:11,note:'本轮输入是已经采样出的第一个输出 token（位置 10），现在为它计算 KV。尾页仍有空间，无需新增 block。'}];
+let phase=1,position=6,layer=0;
+const q=s=>document.querySelector(s);
+function render(){const st=phases[phase],logical=Math.floor(position/4),block=st.blocks[logical],offset=position%4,slot=block*4+offset;
+q('#tokens').innerHTML=st.positions.map(p=>`<button class="${p===position?'selected':''}" aria-pressed="${p===position}" data-p="${p}">t<sub>${p}</sub><small>p = ${p}</small></button>`).join('');
+q('#tokens').querySelectorAll('button').forEach(b=>b.onclick=()=>{position=Number(b.dataset.p);render()});
+q('#mapping').innerHTML=st.blocks.map((b,j)=>`<div class="map-cell ${j===logical?'selected':''}">逻辑 ${j}<b>${b}</b>物理 block</div>`).join('');
+q('#calculation').textContent=`p=${position} → 逻辑块 ${logical} → 物理块 ${block} → offset ${offset} → slot ${slot}`;
+q('#pool').innerHTML=Array.from({length:8},(_,b)=>{let j=st.blocks.indexOf(b);return `<div class="physical ${b===block?'selected':''}"><span>BLOCK ${b} · slots ${b*4}–${b*4+3}</span><div class="cells">${Array.from({length:4},(_,o)=>{let p=j*4+o,valid=j>=0&&p<st.after,focused=b===block&&o===offset;return `<div class="${valid?(p<st.before?'old':'new'):''} ${focused?'focus':''}" title="block ${b} / offset ${o} / slot ${b*4+o}${valid?` / p=${p}`:''}">${valid?'t'+p:'·'}</div>`}).join('')}</div></div>`}).join('');
+q('#tensor-target').textContent=`Layer ${layer} · 普通 K/V 示意视图 [N,B,Hkv,D]\nK_layer${layer}[${block}, ${offset}, :, :] ← K(t${position})    shape: [2,8]\nV_layer${layer}[${block}, ${offset}, :, :] ← V(t${position})    shape: [2,8]\n本轮 slot_mapping = [${st.positions.map(p=>st.blocks[Math.floor(p/4)]*4+p%4).join(', ')}]`;
+q('#phase-note').textContent=st.note;
+}
+q('#phase').onchange=e=>{phase=Number(e.target.value);position=phases[phase].positions[0];render()};q('#layer').onchange=e=>{layer=Number(e.target.value);render()};render();
+const links=[...document.querySelectorAll('nav a')],sections=[...document.querySelectorAll('main section')];
+function update(){const max=document.documentElement.scrollHeight-innerHeight;q('#progress').style.width=(max>0?Math.min(100,scrollY/max*100):0)+'%';let current=sections[0];for(const s of sections){if(s.getBoundingClientRect().top<160)current=s}links.forEach(a=>{const on=a.hash==='#'+current.id;a.classList.toggle('active',on);if(on)a.setAttribute('aria-current','location');else a.removeAttribute('aria-current')})}addEventListener('scroll',update,{passive:true});addEventListener('resize',update);update();
+q('#menu').onclick=()=>{const open=q('.sidebar').classList.toggle('open');q('#menu').setAttribute('aria-expanded',String(open));q('#menu').textContent=open?'关闭目录':'☰ 目录'};links.forEach(a=>a.addEventListener('click',()=>{q('.sidebar').classList.remove('open');q('#menu').setAttribute('aria-expanded','false');q('#menu').textContent='☰ 目录'}));
+q('#reading').onclick=()=>{const wide=document.body.classList.toggle('wide');q('#reading').setAttribute('aria-pressed',String(wide));q('#reading').textContent=wide?'标准阅读':'宽屏阅读'};
+q('#quiz-options').querySelectorAll('button').forEach(b=>b.onclick=()=>{q('#quiz-options').querySelectorAll('button').forEach(x=>x.classList.toggle('chosen',x===b));q('#quiz-feedback').textContent=b.dataset.answer==='29'?'正确。floor(9/4)=2，表项为 7，offset=1，所以 slot=7×4+1=29。':'再想一步：9 是序列位置，7 是物理 block ID。slot 还需要把物理 block ID 乘以 4，再加块内偏移。'});
+function revealSource(){if(location.hash.startsWith('#src-')){const el=document.getElementById(location.hash.slice(1));if(el){el.open=true;requestAnimationFrame(()=>el.scrollIntoView({block:'start'}))}}}addEventListener('hashchange',revealSource);revealSource();

@@ -19,3 +19,7 @@ vLLM-Ascend 363af1c27954ff1f7ae5bd66eef06da62c2e3cd0.
 
 Explanations and worked examples are personal learning notes, not official
 documentation or a claim of runtime compatibility between these revisions.
+
+KV cache book chapter 1 (2026-10-25):
+vLLM 2f1041e8dd05415d9984d0a83ad957d54a049eb4,
+vLLM-Ascend e07bf18b76ce8543baffafa9ba868e86305d15b2.

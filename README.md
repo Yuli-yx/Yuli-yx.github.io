@@ -4,6 +4,13 @@ Yuli-yx 的个人学习网站：vLLM、vLLM-Ascend、MRV2、KV cache。
 
 网站：https://yuli-yx.github.io/
 
+## 当前主页
+
+主页为书籍式 KV cache 源码读本第一章，包含左侧目录、源码摘录和 token/block/slot 交互演算。
+正文与交互源文件位于 `content/book/`；修改后运行 `npm run build` 和 `npm run check`。
+`content/book/sources.json` 记录本章固定版本的源码证据。
+原文章索引保留在 `/articles.html`，原文章与课程 URL 继续可访问。
+
 ## 内容
 
 - MRV2 四个实现跟读单元、原导览和参考表。

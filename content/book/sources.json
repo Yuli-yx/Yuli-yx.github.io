@@ -1,0 +1,128 @@
+{
+  "block": {
+    "title": "KVCacheBlock：只有元数据，没有 K/V tensor",
+    "path": "vllm/v1/core/kv_cache_utils.py",
+    "start": 162,
+    "end": 189,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_utils.py#L162-L189",
+    "code": " 162  class KVCacheBlock:\n 163      \"\"\"KV-cache block metadata.\"\"\"\n 164  \n 165      # Block ID, ranging from 0 to num_gpu_blocks - 1.\n 166      block_id: int\n 167      # Reference count.\n 168      ref_cnt: int = 0\n 169      # Deferred frees may contain blocks from multiple pools.\n 170      pool: \"BlockPool | None\" = field(\n 171          default=None, repr=False, compare=False, kw_only=True\n 172      )\n 173      # The hash key (block hash + group id) of the block, only available\n 174      # when the block is full and cached.\n 175      _block_hash: BlockHashWithGroupId | None = None\n 176      # Number of prefix tokens covered by _block_hash. For full blocks this is\n 177      # the full block boundary; partial entries can end inside a cache block.\n 178      _block_hash_num_tokens: int | None = None\n 179  \n 180      # Used to construct a doubly linked list for free blocks.\n 181      # These two attributes should only be manipulated by FreeKVCacheBlockQueue.\n 182      prev_free_block: \"KVCacheBlock | None\" = None\n 183      next_free_block: \"KVCacheBlock | None\" = None\n 184  \n 185      # Whether the block is a null block that should never be cached.\n 186      is_null: bool = False\n 187  \n 188      @property\n 189      def block_hash(self) -> BlockHashWithGroupId | None:"
+  },
+  "groups": {
+    "title": "KVCacheBlocks：先按 group，再按逻辑 block 排列",
+    "path": "vllm/v1/core/kv_cache_manager.py",
+    "start": 35,
+    "end": 51,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_manager.py#L35-L51",
+    "code": "  35  class KVCacheBlocks:\n  36      \"\"\"The allocation result of KVCacheManager, work as the interface between\n  37      Scheduler and KVCacheManager, to hide KVCacheManager's internal data\n  38      structure from the Scheduler.\n  39      \"\"\"\n  40  \n  41      blocks: tuple[Sequence[KVCacheBlock], ...]\n  42      \"\"\"\n  43      `blocks[i][j]` refers to the i-th kv_cache_group\n  44      and the j-th block of tokens.We don't use block of\n  45      tokens as the outer dimension because it assumes all\n  46      kv_cache_groups have the same number of blocks, which is true for now but\n  47      will be broken if we want to give different block_size to different\n  48      kv_cache_groups in the future.\n  49  \n  50      Each single type KVCacheBlocks could be represented as:\n  51      - list[KVCacheBlock] for more than one KVCacheBlock"
+  },
+  "alloc": {
+    "title": "allocate_kv_cache：共享 backing 与按层视图",
+    "path": "vllm/v1/worker/utils.py",
+    "start": 564,
+    "end": 602,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/utils.py#L564-L602",
+    "code": " 564  def allocate_kv_cache(\n 565      kv_cache_config: KVCacheConfig,\n 566      device: torch.device,\n 567      layout: KVCacheLayout,\n 568      kernel_block_sizes: list[int] | None = None,\n 569  ) -> dict[str, torch.Tensor]:\n 570      \"\"\"Allocate the KV cache and view it as ``[B, H, N, C]`` per layer.\n 571  \n 572      Every KVCacheTensor places its layers in the same backing allocation: layer ``l`` of\n 573      block ``b`` starts at ``offset + l * layer_stride + b * block_stride``. Cache\n 574      groups overlay each other, so tensors may address the same bytes.\n 575      \"\"\"\n 576      if not kv_cache_config.kv_cache_tensors:\n 577          return {}\n 578  \n 579      sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}\n 580      assert len(sizes) == 1, \"KV cache tensors must share one backing allocation.\"\n 581      raw_size = sizes.pop()\n 582      # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)\n 583      # are created lazily on the first qualifying GEMM. Force that now, before\n 584      # the giant backing allocation below: if one landed in this segment's\n 585      # rounding tail it would pin the whole segment at engine shutdown.\n 586      if current_platform.is_rocm():\n 587          warmup_rocm_skinny_gemm_workspaces(device)\n 588          # Pad to the page granularity MoRIIO needs to register the shared\n 589          # backing as a single RDMA memory region. Other platforms keep the\n 590          # exact-size allocation (see #53974), so anything reading\n 591          # storage.nbytes() has to tolerate the tail on ROCm alone.\n 592          page_size = 4096\n 593          buf_size = ((raw_size + page_size - 1) // page_size) * page_size\n 594      else:\n 595          buf_size = raw_size\n 596      buf = torch.zeros(buf_size, dtype=torch.int8, device=device)\n 597  \n 598      kv_caches: dict[str, torch.Tensor] = {}\n 599      for tensor in kv_cache_config.kv_cache_tensors:\n 600          layer_name = tensor.layers[0]\n 601          group_id, group = next(\n 602              (group_id, group)"
+  },
+  "table": {
+    "title": "BlockTables：int32 表与 int64 slot mapping",
+    "path": "vllm/v1/worker/gpu/block_table.py",
+    "start": 75,
+    "end": 106,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/block_table.py#L75-L106",
+    "code": "  75          )\n  76          self.fused_writer: FusedStagedWriter | None = None\n  77          if self.num_kv_cache_groups > 1:\n  78              # Only the multi-group path uses the fused writer.\n  79              self.fused_writer = FusedStagedWriter(\n  80                  self.device, self.num_kv_cache_groups * self.max_num_reqs\n  81              )\n  82  \n  83          # Block tables used for model's forward pass.\n  84          # num_kv_cache_groups x [max_num_reqs, max_num_blocks]\n  85          self.input_block_tables: list[torch.Tensor] = [\n  86              torch.zeros_like(b.gpu) for b in self.block_tables\n  87          ]\n  88          self._num_dirty_rows = 0\n  89  \n  90          self.slot_mappings = torch.zeros(\n  91              self.num_kv_cache_groups,\n  92              self.max_num_batched_tokens,\n  93              dtype=torch.int64,\n  94              device=self.device,\n  95          )\n  96  \n  97          self.init_block_table_layout_tensors()\n  98  \n  99      def _make_ptr_tensor(self, x: Iterable[torch.Tensor]) -> torch.Tensor:\n 100          # NOTE(woosuk): Use uint64 instead of int64 to cover all possible addresses.\n 101          return torch.tensor(\n 102              [t.data_ptr() for t in x], dtype=torch.uint64, device=self.device\n 103          )\n 104  \n 105      def init_block_table_layout_tensors(self) -> None:\n 106          self.block_table_ptrs = self._make_ptr_tensor("
+  },
+  "append": {
+    "title": "append_block_ids：按请求槽位写入 block ID",
+    "path": "vllm/v1/worker/gpu/block_table.py",
+    "start": 125,
+    "end": 146,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/block_table.py#L125-L146",
+    "code": " 125      def append_block_ids(\n 126          self,\n 127          req_index: int,\n 128          new_block_ids: tuple[list[int], ...],\n 129          overwrite: bool,\n 130      ) -> None:\n 131          for i in range(self.num_kv_cache_groups):\n 132              start = self.num_blocks.np[i, req_index] if not overwrite else 0\n 133              block_ids = new_block_ids[i]\n 134              if self.redirect_writes_to_null_block:\n 135                  block_ids = [0] * len(block_ids)\n 136              end = start + len(block_ids)\n 137              row_capacity = self.block_tables[i].gpu.shape[1]\n 138              if end > row_capacity:\n 139                  raise RuntimeError(\n 140                      f\"Block table write for request {req_index}, group {i} exceeds \"\n 141                      f\"row capacity ({end} > {row_capacity})\"\n 142                  )\n 143              self.block_tables[i].stage_write(req_index, start, block_ids)\n 144              self.num_blocks.np[i, req_index] = end\n 145  \n 146      def apply_staged_writes(self) -> None:"
+  },
+  "gather": {
+    "title": "gather_block_tables：收集本轮 batch 的表行",
+    "path": "vllm/v1/worker/gpu/block_table.py",
+    "start": 160,
+    "end": 175,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/block_table.py#L160-L175",
+    "code": " 160      def gather_block_tables(\n 161          self,\n 162          idx_mapping: torch.Tensor,\n 163          num_reqs_padded: int,\n 164          out: tuple[torch.Tensor, ...] | None = None,\n 165          out_ptrs: torch.Tensor | None = None,\n 166          num_computed_tokens: torch.Tensor | None = None,\n 167      ) -> tuple[torch.Tensor, ...]:\n 168          \"\"\"Gather the batch's block-table rows into the forward-pass tables.\n 169  \n 170          When num_computed_tokens ([max_num_reqs], indexed like the block tables)\n 171          is given, sliding-window groups get every entry wholly below the window\n 172          of the request's first scheduled token replaced by the null block. Those\n 173          blocks may already have been freed by the sliding-window manager and\n 174          reused, while attention kernels can still load them as part of a KV\n 175          tile that straddles the window start: masked-out NaN in such a tile"
+  },
+  "slot": {
+    "title": "slot 计算：block number × block size + offset",
+    "path": "vllm/v1/worker/gpu/block_table.py",
+    "start": 398,
+    "end": 414,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/block_table.py#L398-L414",
+    "code": " 398              local_positions = virtual_block_indices * kv_block_size + local_offsets\n 399              local_positions = tl.where(sharded, local_positions, positions)\n 400              is_local = ~sharded | is_local\n 401  \n 402          block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)\n 403          block_offsets = local_positions % kv_block_size\n 404          block_numbers = tl.load(\n 405              block_table_ptr + req_state_idx * block_table_stride + block_indices,\n 406              mask=is_local & is_real_req,\n 407              other=0,\n 408          )\n 409          slot_ids = block_numbers * kv_block_size + block_offsets\n 410          if CP_SIZE != 1:\n 411              slot_ids = tl.where(is_local, slot_ids, PAD_ID)\n 412  \n 413          slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)\n 414          tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)"
+  },
+  "schedule": {
+    "title": "Scheduler：统一用 token 进度描述请求",
+    "path": "vllm/v1/core/sched/scheduler.py",
+    "start": 677,
+    "end": 690,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/sched/scheduler.py#L677-L690",
+    "code": " 677      def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:\n 678          self.current_step += 1\n 679          # NOTE(woosuk) on the scheduling algorithm:\n 680          # There's no \"decoding phase\" nor \"prefill phase\" in the scheduler.\n 681          # Each request just has the num_computed_tokens and\n 682          # num_tokens_with_spec. num_tokens_with_spec =\n 683          # len(prompt_token_ids) + len(output_token_ids) + len(spec_token_ids).\n 684          # At each step, the scheduler tries to assign tokens to the requests\n 685          # so that each request's num_computed_tokens can catch up its\n 686          # num_tokens_with_spec. This is general enough to cover\n 687          # chunked prefills, prefix caching, speculative decoding,\n 688          # and the \"jump decoding\" optimization in the future.\n 689  \n 690          scheduled_new_reqs: list[Request] = []"
+  },
+  "output": {
+    "title": "SchedulerOutput：新请求、增量与调度 token 数",
+    "path": "vllm/v1/core/sched/output.py",
+    "start": 232,
+    "end": 251,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/sched/output.py#L232-L251",
+    "code": " 232  class SchedulerOutput:\n 233      # list of the requests that are scheduled for the first time.\n 234      # We cache the request's data in each worker process, so that we don't\n 235      # need to re-send it every scheduling step.\n 236      scheduled_new_reqs: list[NewRequestData]\n 237      # list of the requests that have been scheduled before.\n 238      # Since the request's data is already cached in the worker processes,\n 239      # we only send the diff to minimize the communication cost.\n 240      scheduled_cached_reqs: CachedRequestData\n 241  \n 242      # req_id -> num_scheduled_tokens\n 243      # Number of tokens scheduled for each request.\n 244      num_scheduled_tokens: dict[str, int]\n 245      # Total number of tokens scheduled for all requests.\n 246      # Equal to sum(num_scheduled_tokens.values())\n 247      total_num_scheduled_tokens: int\n 248      # req_id -> spec_token_ids\n 249      # If a request does not have any spec decode tokens, it will not be\n 250      # included in the dictionary.\n 251      scheduled_spec_decode_tokens: dict[str, list[int]]"
+  },
+  "free": {
+    "title": "free_blocks：引用计数与空闲队列",
+    "path": "vllm/v1/core/block_pool.py",
+    "start": 776,
+    "end": 815,
+    "repo": "vllm",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/block_pool.py#L776-L815",
+    "code": " 776      def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:\n 777          \"\"\"Free a list of blocks. The blocks should be ordered by their\n 778          eviction priority, where the first block will be evicted first.\n 779  \n 780          Args:\n 781              ordered_blocks: A list of blocks to free ordered by their eviction\n 782                  priority.\n 783  \n 784          \"\"\"\n 785          # Identify blocks with hash (LRU cache) and without it (never match APC)\n 786          blocks_to_evict_last = []\n 787          blocks_to_evict_first = []\n 788          other_pools: dict[BlockPool, list[KVCacheBlock]] = {}\n 789          for block in ordered_blocks:\n 790              if block.is_null:  # never pooled; its ref_cnt is not maintained\n 791                  continue\n 792              if block.pool is not None and block.pool is not self:\n 793                  other_pools.setdefault(block.pool, []).append(block)\n 794                  continue\n 795              block.ref_cnt -= 1\n 796              if block.ref_cnt == 0:\n 797                  if block.block_hash is None or not self.enable_caching:\n 798                      # LIFO reuse of non-cached blocks for better GPU locality.\n 799                      blocks_to_evict_first.append(block)\n 800                  else:\n 801                      # FIFO reuse of cached blocks for LRU eviction behavior.\n 802                      blocks_to_evict_last.append(block)\n 803  \n 804          # Blocks to reuse first are prepended to the front of the free queue.\n 805          self.free_block_queue.prepend_n(blocks_to_evict_first)\n 806          # Blocks to reuse last are appended to the end of the free queue.\n 807          self.free_block_queue.append_n(blocks_to_evict_last)\n 808          for pool, blocks in other_pools.items():\n 809              pool.free_blocks(blocks)\n 810  \n 811      def evict_blocks(self, block_ids: set[int]) -> None:\n 812          \"\"\"Evict blocks from the prefix cache by their block IDs.\n 813  \n 814          only evicts blocks that are currently cached (have a hash). blocks\n 815          with ref_cnt > 0 are not freed from the block pool, only evicted"
+  },
+  "shape": {
+    "title": "Ascend：普通 Attention 的两种 cache shape",
+    "path": "vllm_ascend/attention/attention_v1.py",
+    "start": 115,
+    "end": 125,
+    "repo": "vllm-ascend",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/attention/attention_v1.py#L115-L125",
+    "code": " 115      def get_kv_cache_shape(\n 116          num_blocks: int,\n 117          block_size: int,\n 118          num_kv_heads: int,\n 119          head_size: int,\n 120          cache_dtype_str: str = \"\",\n 121      ) -> tuple[int, ...]:\n 122          if envs_vllm.VLLM_KV_CACHE_LAYOUT in (\"LBHNC\", \"HND\"):\n 123              return (2, num_blocks, num_kv_heads, block_size, head_size)\n 124          return (2, num_blocks, block_size, num_kv_heads, head_size)\n 125  "
+  },
+  "write": {
+    "title": "Ascend：写 KV 时传入 slot_mapping",
+    "path": "vllm_ascend/attention/attention_v1.py",
+    "start": 1184,
+    "end": 1205,
+    "repo": "vllm-ascend",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/attention/attention_v1.py#L1184-L1205",
+    "code": "1184      def do_kv_cache_update(\n1185          self,\n1186          layer: torch.nn.Module,\n1187          key: torch.Tensor,\n1188          value: torch.Tensor,\n1189          kv_cache: list[torch.Tensor],\n1190          slot_mapping: torch.Tensor,\n1191      ) -> None:\n1192          if self.attn_type in (AttentionType.ENCODER_ONLY):\n1193              return\n1194  \n1195          if self.key_cache is None:\n1196              self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]\n1197  \n1198          DeviceOperator.reshape_and_cache(\n1199              key=key,\n1200              value=value,\n1201              key_cache=self.key_cache,\n1202              value_cache=self.value_cache,\n1203              slot_mapping=slot_mapping,\n1204              use_bnsd=self.use_bnsd_kv_cache,\n1205          )"
+  },
+  "read": {
+    "title": "Ascend：Paged Attention 使用 block_table 和长度",
+    "path": "vllm_ascend/attention/attention_v1.py",
+    "start": 1139,
+    "end": 1158,
+    "repo": "vllm-ascend",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/attention/attention_v1.py#L1139-L1158",
+    "code": "1139      def forward_paged_attention(\n1140          self,\n1141          query: torch.Tensor,\n1142          attn_metadata: AscendMetadata,\n1143          output: torch.Tensor | None = None,\n1144      ) -> torch.Tensor:\n1145          if _EXTRA_CTX.capturing:\n1146              return self.full_graph_pa(query, attn_metadata, output)\n1147          torch_npu._npu_paged_attention(\n1148              query=query,\n1149              key_cache=self.key_cache,\n1150              value_cache=self.value_cache,\n1151              num_kv_heads=self.num_kv_heads,\n1152              num_heads=self.num_heads,\n1153              scale_value=self.scale,\n1154              block_table=attn_metadata.block_tables,\n1155              context_lens=attn_metadata.seq_lens,\n1156              out=output,\n1157          )\n1158          return output"
+  },
+  "v2": {
+    "title": "Ascend V2：manager block 与 kernel block 的兼容说明",
+    "path": "vllm_ascend/worker/v2/block_table.py",
+    "start": 34,
+    "end": 44,
+    "repo": "vllm-ascend",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/worker/v2/block_table.py#L34-L44",
+    "code": "  34      # manager-block granularity and move the kernel-block mapping into\n  35      # AttentionGroup (kernel_block_table / map_to_kernel_block_table). This class\n  36      # should then stop expanding rows in __init__/append_block_ids, and the\n  37      # Ascend slot-mapping kernel should consume the mapped block table.\n  38  \n  39      block_sizes_tensor: torch.Tensor\n  40      kernel_block_sizes_tensor: torch.Tensor\n  41  \n  42      if vllm_version_is(\"0.31.0\"):\n  43  \n  44          def __init__("
+  }
+}
