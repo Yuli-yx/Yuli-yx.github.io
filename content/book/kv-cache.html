@@ -50,7 +50,68 @@ K_layer[2, 2, :, :]  ← 该 token 在这一层产生的 K
 V_layer[2, 2, :, :]  ← 该 token 在这一层产生的 V
 
 # 上面两项各自是 [2, 8] 的向量切片，不是单个数。</code></pre>
-<p>每个 token 在这一层占用的 K+V 数据量为 <code>2 × 2 × 8 × 2 = 64 bytes</code>；每个 block 为 <code>4 × 64 = 256 bytes</code>；这层 8 个 block 合计 <code>2048 bytes</code>。这里只计 K/V 数值，不计 block table 等元数据，也不包含量化 scale 或特殊对齐开销。</p>
+<h3 id="capacity-calculation">先把每个因子说清楚</h3>
+<p>这里计算的是<strong>当前 rank、当前一层</strong>的普通 K/V 数值容量。沿用本例参数：<code>Hkv=2</code>、<code>D=8</code>、<code>B=4</code>、<code>N=8</code>，dtype 为 BF16。K 与 V 的 head 维度在本例中相同；参数是为了手算而设定的，不是实际模型配置。</p>
+<div class="table-wrap"><table><thead><tr><th>因子</th><th>本例取值</th><th>含义与单位</th></tr></thead><tbody>
+<tr><td>K/V 两份数据</td><td>2</td><td>一份 K，加一份 V。这个 2 不是层数，也不是请求数。</td></tr>
+<tr><td>Hkv</td><td>2 heads</td><td>当前 rank 上每层的 KV head 数量；不是 Q head 数量。</td></tr>
+<tr><td>D</td><td>8 个数 / head</td><td>一个 token 在每个 KV head 中的向量长度。</td></tr>
+<tr><td>每个数的字节数</td><td>2 bytes</td><td>BF16 是 16 bit，16 ÷ 8 = 2 bytes。</td></tr>
+<tr><td>B（block_size）</td><td>4 tokens / block</td><td>一个物理 block 能容纳多少个 token 的 KV。</td></tr>
+<tr><td>N（num_blocks）</td><td>8 blocks</td><td>本例整个缓存池的物理 block 数，不是请求 A 的 block 数。</td></tr>
+</tbody></table></div>
+<h3>① 一个 token：先数元素，再乘字节数</h3>
+<p>一个 token 的 K 是 <code>[Hkv,D]=[2,8]</code> 的切片，包含 16 个 BF16 数值，因此占用 32 bytes。V 同样占用 32 bytes：</p>
+<pre><code>K：head 0 → 8 个 BF16 数值 → 16 bytes
+   head 1 → 8 个 BF16 数值 → 16 bytes
+                              合计 32 bytes
+
+V：head 0 → 8 个 BF16 数值 → 16 bytes
+   head 1 → 8 个 BF16 数值 → 16 bytes
+                              合计 32 bytes
+
+每个 token 的 K+V = 32 + 32 = 64 bytes
+                 = 2 × 2 × 8 × 2 bytes
+                   │   │   │   └─ 每个 BF16 数值占 2 bytes
+                   │   │   └───── 每个 head 的维度 D=8
+                   │   └───────── 本 rank 的 KV head 数 Hkv=2
+                   └───────────── K、V 两份数据</code></pre>
+<p>例如位置 <code>p=6</code> 对应物理 block 2、offset 2：<code>K_layer[2,2,:,:]</code> 和 <code>V_layer[2,2,:,:]</code> 各是 <code>[2,8]</code> 的切片，各占 32 bytes。<strong>一个 slot 对应的是这个 token 的向量切片，不能把 slot 当作一个 BF16 标量。</strong></p>
+<h3>② 一个 block：容纳 4 个 token 的 KV</h3>
+<p>一个 block 有 <code>B=4</code> 个 token 槽位，因此本层一页 K 加对应一页 V 的容量为：</p>
+<pre><code>每 block 的 K+V 容量
+= 4 tokens/block × 64 bytes/token
+= 256 bytes/block
+
+其中 K 页占 128 bytes，V 页占 128 bytes。</code></pre>
+<h3>③ 整层缓存池：预留了 8 个物理 block</h3>
+<p>本例这一层的缓存池容量为 <code>8 blocks × 256 bytes/block = 2048 bytes = 2 KiB</code>。也可以直接从完整 tensor 的 shape 交叉核对：</p>
+<pre><code>K_layer.shape = [N, B, Hkv, D] = [8, 4, 2, 8]
+V_layer.shape = [N, B, Hkv, D] = [8, 4, 2, 8]
+
+K 的元素数 = 8 × 4 × 2 × 8 = 512
+K 的字节数 = 512 × 2 = 1024 bytes
+V 的字节数 = 512 × 2 = 1024 bytes
+
+K + V = 1024 + 1024 = 2048 bytes</code></pre>
+<h3 id="capacity-accounting">三种口径：有效数据、请求容量、整个池容量</h3>
+<p>现在选择一个明确时点：<strong>请求 A 的 10 个 prompt token 已全部计算完，尚未计算位置 10 的输出 token 的 KV。</strong>沿用无 prefix 共享、无额外预留的前提，A 使用 <code>[5,2,7]</code> 三个 block。</p>
+<div class="table-wrap"><table><thead><tr><th>统计口径</th><th>计算方式</th><th>本例结果</th></tr></thead><tbody>
+<tr><td><b>A 的有效 KV 数据量</b></td><td>已计算的 10 个 token × 64 bytes/token</td><td>640 bytes</td></tr>
+<tr><td><b>分配给 A 的 block 容量</b></td><td>ceil(10/4) × 256 bytes/block = 3 × 256</td><td>768 bytes</td></tr>
+<tr><td><b>这一层整个缓存池容量</b></td><td>8 blocks × 256 bytes/block</td><td>2048 bytes</td></tr>
+</tbody></table></div>
+<p>三页可以容纳 12 个 token，但 A 只计算了 10 个。物理 block 7 中 offset 2、3 仍是未使用槽位，因此 A 的尾块空闲容量为 <code>768 − 640 = 128 bytes</code>，也就是 <code>2 slots × 64 bytes/slot</code>。</p>
+<pre><code>整个缓存池的本层 K+V 容量：2048 bytes
+├─ A 所占三页的容量：768 bytes
+│  ├─ A 的有效 KV：640 bytes（位置 0…9）
+│  └─ A 的尾页剩余：128 bytes（可容纳位置 10、11）
+└─ 不属于 A 的五页容量：1280 bytes
+   它们可能空闲，也可能由其他请求或缓存占用；本例不作假设。</code></pre>
+<p>所以 <strong>640、768、2048 不能相加</strong>：它们描述嵌套的范围。640 bytes 位于 A 的 768 bytes 内，而 A 的 768 bytes 又属于整个池的 2048 bytes。尾页的 128 bytes 在本例中仍属于 A 所占用的页，并不是可独立分配给另一个请求的一整页。</p>
+<p>下一步为位置 10 计算 KV 后，A 的有效数据增长到 <code>11 × 64 = 704 bytes</code>，但仍然只需要 3 个 block：请求分配容量保持 768 bytes，池容量保持 2048 bytes。这正好说明，<strong>有效数据增长不一定触发新 block 分配，分配新 block 也不等于扩建设备缓存池。</strong></p>
+<div class="callout"><b>公式的适用范围</b><p>对本例普通、等维 K/V，每 token 每层的数值大小为 <code>2 × Hkv_local × D × dtype_bytes</code>。这里不计 block table 等元数据、量化 scale、padding、特殊 stride 或对齐开销，也不是整个进程的显存占用。其他层还需要自己的缓存；只有各层规格相同且没有缓存共享时，才可直接乘层数。MLA、K/V 不等维、量化或共享存储应按各自实际布局重新计算。</p></div>
+
 <h3>多层使用同一个 block ID，为什么不会互相覆盖？</h3><p>对于本例中的普通多层 Full Attention group，请求在各层使用相同的 block ID 序列，但每层都有自己的缓存视图和对应的地址范围。<code>K_layer0[2,2,:,:]</code> 与 <code>K_layer1[2,2,:,:]</code> 表示不同层的内容。<strong>相同索引不意味着相同 tensor 或相同地址。</strong></p><p>还要进一步区分“不同视图”和“不同分配”：当前 vLLM 的 <code>allocate_kv_cache()</code> 会创建统一的 backing buffer，然后按描述符构造各层 view；源码也明确说明 cache groups 可能覆盖同一 backing 区域。因此，不能把示意中的每层 K/V 画法理解成“每层都单独调用一次内存分配”。共享关系由 cache 规划、offset 和 stride 决定。</p><details class="source" id="src-alloc"><summary><span>源码证据</span> allocate_kv_cache：共享 backing 与按层视图 <small>vllm · L564–602</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/utils.py#L564-L602" target="_blank" rel="noopener">打开固定提交的 GitHub 源码 ↗</a><br><code>vllm/v1/worker/utils.py</code></p><pre><code> 564  def allocate_kv_cache(
  565      kv_cache_config: KVCacheConfig,
  566      device: torch.device,
