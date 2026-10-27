@@ -1,0 +1,315 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="从历史 K/V 到压缩表示和递归状态，逐项说明缓存内容与容量公式为什么会变化。"><title>Attention 结构决定缓存什么｜推理系统源码读本</title><link rel="stylesheet" href="assets/book/styles.css"></head><body><a class="skip" href="#main">跳到正文</a><div id="progress"></div><button id="menu" aria-label="打开目录" aria-expanded="false">☰ 目录</button><aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">kv<span>·</span></span><strong>推理系统源码读本<small>vLLM × vLLM-Ascend</small></strong></a><div class="topic-label">专题导航</div><nav class="topic-nav" aria-label="全站专题"><a href="index.html" >总览 · 推理系统源码读本</a><a href="kv-outline.html" class="selected-topic">KV Cache 管理<small>已写 3 章</small></a><a href="index.html#pd" >P/D 分离<small>规划</small></a><a href="index.html#pool" >KV Pool 池化<small>规划</small></a><a href="index.html#cp" >PCP / DCP<small>规划</small></a><a href="courses/model-runner/index.html" >Model Runner<small>已有</small></a></nav><p class="community-link"><a href="contributing.html">共建说明：要求、计划与接续方法 →</a></p><div class="book-label">KV CACHE 管理 / 第 02 章</div><div class="current-chapter"><strong>Attention 结构决定缓存什么</strong></div><nav aria-label="本章目录"><a href="#ordinary">1. 普通 Attention 为什么保留 K 和 V？</a><a href="#heads">2. MHA、GQA、MQA 改变的是哪些 head？</a><a href="#mla">3. MLA：保存的可以是压缩表示</a><a href="#sparse">4. 稀疏、窗口和压缩，是三个不同问题</a><a href="#state">5. GDN / KDA：维护状态，而不是逐项留下所有历史</a><a href="#hybrid">6. 混合模型要逐层记账</a></nav><details class="book-outline"><summary>本专题大纲 <span>16 章</span></summary><p><a href="kv-outline.html">查看完整目录与模型案例 →</a></p><ol><li><span>01</span><a href="kv-cache.html">谁在管理 KV Cache？</a><small>已编写</small></li><li><span>02</span><a href="kv-attention.html" aria-current="page">Attention 结构决定缓存什么</a><small>本章</small></li><li><span>03</span><a href="kv-model-path.html">从模型配置找到真实实现</a><small>已编写</small></li><li><span>04</span><a href="kv-outline.html#chapter-04">Cache spec、group 与物理布局</a><small>待写</small></li><li><span>05</span><a href="kv-outline.html#chapter-05">启动时怎样建立缓存池</a><small>待写</small></li><li><span>06</span><a href="kv-outline.html#chapter-06">一轮请求怎样分配、写入和读取</a><small>待写</small></li><li><span>07</span><a href="kv-outline.html#chapter-07">复用、回收与恢复</a><small>待写</small></li><li><span>08</span><a href="kv-outline.html#chapter-08">普通 GQA 模型：完整基线案例</a><small>待写</small></li><li><span>09</span><a href="kv-outline.html#chapter-09">Qwen3.5 / Qwen3.6：Full Attention + GDN</a><small>待写</small></li><li><span>10</span><a href="kv-outline.html#chapter-10">Kimi K3：MLA + KDA</a><small>待写</small></li><li><span>11</span><a href="kv-outline.html#chapter-11">DeepSeek V4：压缩与多类缓存</a><small>待写</small></li><li><span>12</span><a href="kv-outline.html#chapter-12">GLM-5.3：稀疏 Attention 缓存链路</a><small>待写</small></li><li><span>13</span><a href="kv-outline.html#chapter-13">GLM-5.3-Flash：混合 Attention 与辅助状态</a><small>待写</small></li><li><span>14</span><a href="kv-outline.html#chapter-14">同一个请求，在不同模型里会发生什么？</a><small>待写</small></li><li><span>15</span><a href="kv-outline.html#chapter-15">如何算准一个真实模型的缓存容量？</a><small>待写</small></li><li><span>16</span><a href="kv-outline.html#chapter-16">接到系统专题：并行、传输与池化</a><small>待写</small></li></ol></details></aside><div class="page"><header class="topbar"><span><a href="index.html">专题总览</a> / <a href="kv-outline.html">KV Cache 目录</a></span><button id="reading" aria-pressed="false">宽屏阅读</button></header><main id="main"><div class="eyebrow">CHAPTER 02<span>源码 · 例子 · 计算过程</span></div><h1>Attention 结构决定缓存什么</h1><p class="dek">从历史 K/V 到压缩表示和递归状态，逐项说明缓存内容与容量公式为什么会变化。</p><div class="version"><b>源码基线 / 2026.10.25</b><span>vLLM 2f1041e8dd · Ascend e07bf18b76</span><span>章节更新 / 2026.10.27</span></div><div class="intro"><p>第一章把 token 位置映射到了缓存槽位。本章继续回答：这个槽位里究竟要保存什么？普通 Attention 保存历史 K/V；MLA 可以保存压缩表示；GDN、KDA 一类计算还需要维护递归状态。缓存内容变了，容量公式、更新方式和恢复条件也会跟着变。</p><p>先用小尺寸例子理解这些差异，再阅读实际模型。下面的数值都用于手算，不代表某个 checkpoint 的真实参数。源码依据仍是 2026 年 10 月 25 日固定的两份提交；本章没有运行设备实验。</p></div>
+<section id="ordinary"><h2>1. 普通 Attention 为什么保留 K 和 V？</h2><p>考虑一个 decoder 层的一个 Attention head。在位置 t，模型从当前隐藏向量产生 query（Q）、key（K）和 value（V）。当前 Q 与允许访问的每个 K 计算分数，把分数归一化成权重，再用这些权重对 V 求和。</p><pre><code>score(t,j) = dot(q_t, k_j) / sqrt(Dk) + mask(t,j)
+weight(t,:) = softmax(score(t,:))
+output_t = Σ_j weight(t,j) × v_j</code></pre><p>这里 t 是当前 query 的位置，j 是被读取的位置；Dk 是 Q/K 的 head 维度。对普通因果 Attention，位置 t 不能读取未来位置 j&gt;t。mask 将这些位置排除。式子只描述一个 head；多个 head 的输出还需要后续组合和投影。</p><h3>一步 decode 的具体输入</h3><p>假设已经为位置 0、1、2 算好 KV，现在把位置 3 的 token 送进模型。当前层产生 q₃、k₃、v₃；计算输出时，q₃ 需要访问 k₀…k₃ 与 v₀…v₃。保留历史 KV，就不必重新执行旧 token 来获得它们。</p><pre><code>本轮新产生：q₃、k₃、v₃
+缓存中已有：k₀、k₁、k₂；v₀、v₁、v₂
+本轮写入：  k₃、v₃
+本轮读取：  k₀…k₃；v₀…v₃
+
+下一轮位置 4 的 query 使用 q₄，不需要重新使用 q₃。</code></pre><p>因此，普通自回归 Attention 的持久缓存通常保存 K/V，而不是全部历史 Q。这里说的是 Attention 的缓存需求；特定模型或投机执行路径可能另外保存 hidden states 等对象，不能由这条结论推断整个系统只保存 K/V。</p><h3>Prefill 与 decode 沿用同一个因果关系</h3><p>Prefill 可以一次处理多个 query。若一个 chunk 包含位置 4、5、6，位置 4 只能看到此前允许的历史与自己，不能看到位置 5、6；位置 6 则可以看到本 chunk 内更早的位置。实现可以批量计算，但每个 query 的可见范围仍由 mask 和长度确定。</p><p>这也解释了第一章的两类索引：slot mapping 指定本轮新 K/V 的写入位置；block table 结合长度等 metadata 帮助算子定位历史。两者都不代替 causal mask。</p></section>
+<section id="heads"><h2>2. MHA、GQA、MQA 改变的是哪些 head？</h2><p>Q heads 决定模型并行产生多少组 query；KV heads 决定要保存多少组 K/V。MHA 中两者数量相同；GQA 中多个 Q heads 共用一组 KV；MQA 可以看作只有一个 KV head 的情形。具体的 head 对应关系由实现确定。</p><p>做一组同口径比较：只看单 rank 的一层，不做 TP 切分；固定 Q head 数为 8，K/V head 维度均为 8，K/V 用 BF16 存储。这里的 BF16 每个数占 2 bytes。</p><div class="table-wrap"><table><thead><tr><th>结构</th><th>Q heads</th><th>KV heads</th><th>每 token 的 K+V 数值大小</th></tr></thead><tbody><tr><td>MHA</td><td>8</td><td>8</td><td>2 × 8 × 8 × 2 = 256 bytes</td></tr><tr><td>GQA</td><td>8</td><td>2</td><td>2 × 2 × 8 × 2 = 64 bytes</td></tr><tr><td>MQA</td><td>8</td><td>1</td><td>2 × 1 × 8 × 2 = 32 bytes</td></tr></tbody></table></div><p>每行算式依次是：K/V 两份 × KV head 数 × 每个 head 的维度 × 每个数的字节数。Q head 数没有直接出现在缓存容量公式中，因为这里没有统计 Q 的临时输入和计算工作区。</p><p>如果 K 与 V 的 head 维度不同，应改为 <code>Hkv_local × (Dk + Dv) × bytes_per_element</code>，前提仍是 K/V 使用相同 dtype、按普通数值布局存储。若使用不同 dtype，则 K、V 必须分别求字节数再相加。跨 TP rank 计算时，要使用本 rank 实际保存的 head 数，不能不看实现就把全局 head 数除以 TP。</p><p>普通 Attention 层会根据 Attention 类型和配置声明 spec。例如 encoder-only 层不需要自回归 KV，源码会返回 <code>None</code>。所以“模型中有 Attention 模块”并不必然意味着“这个模块占用一组持久 KV”。</p><details class="source" id="src-ordinary"><summary><span>源码证据</span>普通 Attention 按类型决定是否声明缓存<small>vllm · 2f1041e8dd · L608–619</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/attention/attention.py#L608-L619" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/layers/attention/attention.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 608      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec | None:
+ 609          # Block size may get updated after model loading, refresh it
+ 610          block_size = vllm_config.cache_config.block_size
+ 611          # Encoder-only attention is prefill-only and keeps no autoregressive KV
+ 612          # cache. In hybrid models (e.g. Qwen3.5 / ColQwen3.5: GatedDeltaNet
+ 613          # linear_attention interleaved with full_attention) the runner iterates
+ 614          # every attention module to build the KV-cache spec, so an ENCODER_ONLY
+ 615          # full_attention layer reaches here; it contributes no KV cache group.
+<span class="code-comment">      # [讲解补充] 这里按 attention 类型决定是否声明缓存；encoder 分支返回 None。</span>
+ 616          if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+ 617              return None
+ 618          # Should not be called for enc-dec attention.
+ 619          assert self.attn_type == AttentionType.DECODER</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 608      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec | None:
+ 609          # Block size may get updated after model loading, refresh it
+ 610          block_size = vllm_config.cache_config.block_size
+ 611          # Encoder-only attention is prefill-only and keeps no autoregressive KV
+ 612          # cache. In hybrid models (e.g. Qwen3.5 / ColQwen3.5: GatedDeltaNet
+ 613          # linear_attention interleaved with full_attention) the runner iterates
+ 614          # every attention module to build the KV-cache spec, so an ENCODER_ONLY
+ 615          # full_attention layer reaches here; it contributes no KV cache group.
+ 616          if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
+ 617              return None
+ 618          # Should not be called for enc-dec attention.
+ 619          assert self.attn_type == AttentionType.DECODER</code></pre></details></details></section>
+<section id="mla"><h2>3. MLA：保存的可以是压缩表示</h2><p>MLA 的关键在于低维表示。以包含位置编码分量的一种常见形式为例，模型把输入变换成压缩 latent，再由它产生 Attention 所需的部分 K/V；位置编码相关的 K 分量另行处理。在可使用压缩缓存的实现中，长期保存的是 latent 和需要的位置分量，而不是所有 heads 展开的完整 K/V。</p><p>这里只比较存储，不把简化示意当作模型完整公式。设一个 token 保存的 latent 长度 R=4，额外位置分量长度 Dr=2；二者都使用 BF16，无 scale、padding 或其他辅助项：</p><pre><code>latent：4 个数 × 2 bytes = 8 bytes
+位置分量：2 个数 × 2 bytes = 4 bytes
+本例每 token 的缓存内容：8 + 4 = 12 bytes</code></pre><p>这里不能再乘“2 份 K/V”，因为已经按实际保存的两个分量分别计数。它也不证明某个真实 MLA 模型只需 12 bytes/token：真实 R、位置分量、量化布局和辅助缓存必须从配置与实现确认。no-RoPE 的 MLA 路径也不能直接照搬上面的位置分量。</p><p>vLLM 的 <code>MLAAttention.get_kv_cache_spec()</code> 使用 <code>MLAAttentionSpec</code> 等类型，并将 <code>num_kv_heads</code> 设为 1。这里的 1 是缓存表示的字段，不能据此宣称模型只有一个 Q head。源码还对部分打包量化格式直接设置 <code>state_content_bytes</code>，因为此时实际字节数不能只用 head_size 推出。</p><details class="source" id="src-mla"><summary><span>源码证据</span>MLA 的缓存 spec 与打包格式字节数<small>vllm · 2f1041e8dd · L1371–1401</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/attention/mla_attention.py#L1371-L1401" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/layers/attention/mla_attention.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1371      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec:
+1372          kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+1373              self.kv_cache_dtype, vllm_config.model_config
+1374          )
+1375          common_kwargs = dict(
+1376              block_size=vllm_config.cache_config.block_size,
+1377              num_kv_heads=1,
+1378              max_tp_shards=1,
+1379              head_size=self.head_size,
+1380              dtype=kv_cache_dtype,
+1381              cache_dtype_str=self.kv_cache_dtype,
+1382              kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+1383              # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
+1384              # blob, so the size is not derivable from head_size.
+1385              # See flashmla_sparse.py.
+<span class="code-comment">      # [讲解补充] 这些打包格式直接指定每 token 字节数，不能仅用 head_size 推算。</span>
+1386              state_content_bytes={&quot;fp8_ds_mla&quot;: 656, &quot;nvfp4_ds_mla&quot;: 352}.get(
+1387                  self.kv_cache_dtype
+1388              ),
+1389          )
+1390          if self.sliding_window is not None:
+1391              return SlidingWindowMLASpec(
+1392                  **common_kwargs,
+1393                  sliding_window=self.sliding_window,
+1394              )
+1395          spec = MLAAttentionSpec(
+1396              **common_kwargs,
+1397              topk_buffer_width=self.topk_buffer_width,
+1398              is_index_group_leader=self.indexer is not None,
+1399              non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+1400          )
+1401          return spec</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1371      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec:
+1372          kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+1373              self.kv_cache_dtype, vllm_config.model_config
+1374          )
+1375          common_kwargs = dict(
+1376              block_size=vllm_config.cache_config.block_size,
+1377              num_kv_heads=1,
+1378              max_tp_shards=1,
+1379              head_size=self.head_size,
+1380              dtype=kv_cache_dtype,
+1381              cache_dtype_str=self.kv_cache_dtype,
+1382              kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
+1383              # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token
+1384              # blob, so the size is not derivable from head_size.
+1385              # See flashmla_sparse.py.
+1386              state_content_bytes={&quot;fp8_ds_mla&quot;: 656, &quot;nvfp4_ds_mla&quot;: 352}.get(
+1387                  self.kv_cache_dtype
+1388              ),
+1389          )
+1390          if self.sliding_window is not None:
+1391              return SlidingWindowMLASpec(
+1392                  **common_kwargs,
+1393                  sliding_window=self.sliding_window,
+1394              )
+1395          spec = MLAAttentionSpec(
+1396              **common_kwargs,
+1397              topk_buffer_width=self.topk_buffer_width,
+1398              is_index_group_leader=self.indexer is not None,
+1399              non_causal_multi_token_decode=self.non_causal_multi_token_decode,
+1400          )
+1401          return spec</code></pre></details></details><p>阅读 MLA 时要分别记录：数学计算使用的 Q/K/V 维度、长期保留的缓存分量、kernel 接收的 tensor view。这三个层面的 shape 不一定相同。Prefill 和 decode 也可能采用不同的计算形式，但仍使用同一套模型参数。</p></section>
+<section id="sparse"><h2>4. 稀疏、窗口和压缩，是三个不同问题</h2><p>“本次只读少量位置”与“只存少量位置”之间没有必然等号。稀疏 Attention 可能通过 indexer 选择少量历史位置，却仍然保留大范围主 KV，以便后续 query 选择其他位置。要判断容量，必须同时检查保留策略与计算路径。</p><div class="table-wrap"><table><thead><tr><th>机制</th><th>首先要问什么？</th><th>不能直接推出什么？</th></tr></thead><tbody><tr><td>滑动窗口</td><td>当前 query 允许读取多远的历史？哪些旧位置可回收？</td><td>逻辑窗口长度不一定等于最终分配字节数，还要按 block、对齐和保留策略计算。</td></tr><tr><td>稀疏选择</td><td>从哪些候选位置里选出本轮要读的位置？</td><td>不能把 top-k 直接当作缓存池最多存 k 个 token。</td></tr><tr><td>压缩表示</td><td>一个存储条目代表多少原始 token，保存了哪些分量？</td><td>不能把所有主缓存与辅助缓存都按同一压缩比例缩小。</td></tr></tbody></table></div><p>例如，假设一个教学压缩器每完成 4 个原始 token 就产生一个存储条目。10 个 token 只完成两组，还有两个 token 的未完成尾部。若该算法需要保留尾部状态，完整账单必须把“两条压缩记录”和“尾部状态”分开。这是解释计数方法的例子，不是对 DSV4 或 GLM 实际尾部算法的断言。</p><p>DSV4 的实际源码说明了为什么需要逐项查证：indexer 的 spec 使用 <code>tokens_per_state</code> 表示压缩关系；compressor 的状态缓存则另有 spec、窗口与 padding。后面的 DSV4 案例会把这些对象逐个列出。</p><details class="source" id="src-ds-index"><summary><span>源码证据</span>DSV4 indexer 的压缩关系与 spec<small>vllm-ascend · e07bf18b76 · L147–170</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/models/deepseek_v4/indexer.py#L147-L170" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/models/deepseek_v4/indexer.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 这是 indexer 的缓存声明，只覆盖该组件，不代表整个 DSV4 模型的缓存。</span>
+ 147      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec:
+ 148          from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+ 149          from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+ 150
+ 151          storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
+ 152          # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with
+ 153          # AttentionSpec.tokens_per_state on main.
+ 154          ratio_kwargs = {&quot;tokens_per_state&quot;: self.compress_ratio}
+ 155          return AscendMLAAttentionSpec(
+ 156              block_size=storage_block_size * self.compress_ratio,
+ 157              num_kv_heads=1,
+ 158              head_size=self.head_dim,
+ 159              dtype=self.dtype,
+ 160              model_version=&quot;deepseek_v4&quot;,
+ 161              cache_dtype_str=self.cache_config.cache_dtype,
+ 162              scale_dim=1 if self.head_dim == 128 else 0,
+ 163              scale_dtype=torch.float
+ 164              if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+ 165              else torch.float16,
+ 166              **ratio_kwargs,
+ 167          )
+ 168
+ 169      def forward(self): ...
+ 170  </code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 147      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec:
+ 148          from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
+ 149          from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES
+ 150
+ 151          storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]
+ 152          # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with
+ 153          # AttentionSpec.tokens_per_state on main.
+ 154          ratio_kwargs = {&quot;tokens_per_state&quot;: self.compress_ratio}
+ 155          return AscendMLAAttentionSpec(
+ 156              block_size=storage_block_size * self.compress_ratio,
+ 157              num_kv_heads=1,
+ 158              head_size=self.head_dim,
+ 159              dtype=self.dtype,
+ 160              model_version=&quot;deepseek_v4&quot;,
+ 161              cache_dtype_str=self.cache_config.cache_dtype,
+ 162              scale_dim=1 if self.head_dim == 128 else 0,
+ 163              scale_dtype=torch.float
+ 164              if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)
+ 165              else torch.float16,
+ 166              **ratio_kwargs,
+ 167          )
+ 168
+ 169      def forward(self): ...
+ 170  </code></pre></details></details></section>
+<section id="state"><h2>5. GDN / KDA：维护状态，而不是逐项留下所有历史</h2><p>GDN、KDA 一类递归计算可以用“旧状态 + 当前输入 → 新状态”来理解。下面只是接口关系，不是它们的数学更新公式：</p><pre><code>S_t = update(S_(t-1), 当前输入及门控等参数)
+output_t = read(S_t, 当前 query 等输入)</code></pre><p>旧 token 对未来的影响进入状态 S。继续处理新 token 时，模型更新状态，而不是像普通 Full Attention 那样，为每个历史位置永久追加一份完整 K/V。具体实现还可能需要卷积历史、临时状态、投机副本和用于恢复的 checkpoint。</p><h3>一个状态容量的手算例子</h3><p>假设某个教学层需要以下两项，且只统计一份当前状态。它们不是 Qwen 或 Kimi 的真实 shape：</p><pre><code>递归状态：shape [2,8,8]，FP32
+  元素数 = 2 × 8 × 8 = 128
+  字节数 = 128 × 4 = 512 bytes
+
+卷积历史：shape [3,32]，BF16
+  元素数 = 3 × 32 = 96
+  字节数 = 96 × 2 = 192 bytes
+
+一份状态内容 = 512 + 192 = 704 bytes</code></pre><p>这里不能乘请求的 token 数 T，因为统计的是一份随输入更新的当前状态，而不是 T 份历史记录。如果执行策略需要保留多个状态副本或 checkpoint，还要按实际保留数量计算。每页的 padding 也应单独计入。</p><p><code>MambaSpec</code> 的 <code>shapes</code> 与 <code>dtypes</code> 正是按这种方式描述状态：逐项计算元素数乘 dtype 字节数，再求和。名称叫 MambaSpec，不代表使用它的模型一定是 Mamba；阅读时要看实际层类型。该类还包含 speculative 和 prefill checkpoint 等字段，因此“状态本身不按历史长度线性增长”不意味着“运行中永远只分配一份状态”。</p><details class="source" id="src-mamba"><summary><span>源码证据</span>MambaSpec 按 shape 与 dtype 计算状态容量<small>vllm · 2f1041e8dd · L1079–1128</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L1079-L1128" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/kv_cache_interface.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1079  class MambaSpec(KVCacheSpec):
+1080      shapes: tuple[tuple[int, ...], ...]
+1081      dtypes: tuple[torch.dtype, ...]
+1082      page_size_padded: int | None = None
+1083      mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
+1084      mamba_cache_mode: str = &quot;none&quot;
+1085      num_speculative_blocks: int = 0
+1086      num_prefill_checkpoint_blocks: int = 0
+1087      prefill_checkpoint_alignment: int | None = None
+1088      num_heads: int = 1
+1089      tokens_per_state: int = -1
+1090      # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+1091      # rank holds the full state (e.g. the replicated PLE conv state).
+1092      tp_replicated: bool = False
+1093
+1094      @property
+1095      def state_content_size_bytes(self) -&gt; int:
+<span class="code-comment">      # [讲解补充] 逐个状态计算元素数 × dtype 字节数，再求和；此处没有乘历史 token 数。</span>
+1096          return sum(
+1097              prod(shape) * get_dtype_size(dtype)
+1098              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1099          )
+1100
+1101      @property
+1102      def real_page_size_bytes(self) -&gt; int:
+1103          return self.state_content_size_bytes
+1104
+1105      @property
+1106      def page_size_bytes(self) -&gt; int:
+1107          page_size = sum(
+1108              prod(shape) * get_dtype_size(dtype)
+1109              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1110          )
+1111          if self.page_size_padded is not None:
+1112              assert self.page_size_padded &gt;= page_size
+1113              return self.page_size_padded
+1114          return page_size
+1115
+1116      @property
+1117      def block_table_token_alignment(self) -&gt; int | None:
+1118          return None
+1119
+1120      def max_memory_usage_bytes(self, vllm_config: VllmConfig) -&gt; int:
+1121          if vllm_config.cache_config.mamba_cache_mode == &quot;align&quot;:
+1122              return self.page_size_bytes * (
+1123                  2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+1124              )
+1125          else:
+1126              return self.page_size_bytes * (1 + self.num_speculative_blocks)
+1127
+1128      def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -&gt; int:</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1079  class MambaSpec(KVCacheSpec):
+1080      shapes: tuple[tuple[int, ...], ...]
+1081      dtypes: tuple[torch.dtype, ...]
+1082      page_size_padded: int | None = None
+1083      mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
+1084      mamba_cache_mode: str = &quot;none&quot;
+1085      num_speculative_blocks: int = 0
+1086      num_prefill_checkpoint_blocks: int = 0
+1087      prefill_checkpoint_alignment: int | None = None
+1088      num_heads: int = 1
+1089      tokens_per_state: int = -1
+1090      # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+1091      # rank holds the full state (e.g. the replicated PLE conv state).
+1092      tp_replicated: bool = False
+1093
+1094      @property
+1095      def state_content_size_bytes(self) -&gt; int:
+1096          return sum(
+1097              prod(shape) * get_dtype_size(dtype)
+1098              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1099          )
+1100
+1101      @property
+1102      def real_page_size_bytes(self) -&gt; int:
+1103          return self.state_content_size_bytes
+1104
+1105      @property
+1106      def page_size_bytes(self) -&gt; int:
+1107          page_size = sum(
+1108              prod(shape) * get_dtype_size(dtype)
+1109              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1110          )
+1111          if self.page_size_padded is not None:
+1112              assert self.page_size_padded &gt;= page_size
+1113              return self.page_size_padded
+1114          return page_size
+1115
+1116      @property
+1117      def block_table_token_alignment(self) -&gt; int | None:
+1118          return None
+1119
+1120      def max_memory_usage_bytes(self, vllm_config: VllmConfig) -&gt; int:
+1121          if vllm_config.cache_config.mamba_cache_mode == &quot;align&quot;:
+1122              return self.page_size_bytes * (
+1123                  2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+1124              )
+1125          else:
+1126              return self.page_size_bytes * (1 + self.num_speculative_blocks)
+1127
+1128      def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -&gt; int:</code></pre></details></details><h3>为什么恢复一个旧前缀需要额外考虑？</h3><p>当前状态已经吸收了后续输入，通常不能直接把它当作较早位置的状态。如果要从某个前缀继续，需要对应位置的可恢复状态，或从可用边界重算。Qwen GDN 的代码中存在按条件补充 prefill checkpoint spec 的路径；这说明是否能恢复、恢复到哪里，要跟随具体实现和配置，而不能只凭模型属于“线性 Attention”判断。</p><details class="source" id="src-checkpoint"><summary><span>源码证据</span>Qwen GDN 按条件增加 checkpoint 声明<small>vllm · 2f1041e8dd · L739–750</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py#L739-L750" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 739      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec | None:
+ 740          spec = super().get_kv_cache_spec(vllm_config)
+<span class="code-comment">      # [讲解补充] 只有导出 checkpoint 且 spec 为 MambaSpec 时，才继续增加相关声明。</span>
+ 741          if not self._exports_checkpoints or not isinstance(spec, MambaSpec):
+ 742              return spec
+ 743          # FlashInfer emits states at one stride for the whole batch, the gcd of
+ 744          # the offsets; keeping every offset on the prefix-cache grid keeps that
+ 745          # stride a multiple of the grid, which bounds the states emitted.
+ 746          return replace(
+ 747              spec,
+ 748              num_prefill_checkpoint_blocks=1,
+ 749              prefill_checkpoint_alignment=get_mamba_prefill_checkpoint_grid(vllm_config),
+ 750          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 739      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec | None:
+ 740          spec = super().get_kv_cache_spec(vllm_config)
+ 741          if not self._exports_checkpoints or not isinstance(spec, MambaSpec):
+ 742              return spec
+ 743          # FlashInfer emits states at one stride for the whole batch, the gcd of
+ 744          # the offsets; keeping every offset on the prefix-cache grid keeps that
+ 745          # stride a multiple of the grid, which bounds the states emitted.
+ 746          return replace(
+ 747              spec,
+ 748              num_prefill_checkpoint_blocks=1,
+ 749              prefill_checkpoint_alignment=get_mamba_prefill_checkpoint_grid(vllm_config),
+ 750          )</code></pre></details></details></section>
+<section id="hybrid"><h2>6. 混合模型要逐层记账</h2><p>Qwen3.5 的 decoder 根据层类型建立不同模块：<code>linear_attention</code> 使用 GDN，<code>full_attention</code> 使用普通 Attention 路径。两类层所需的缓存不能合并成同一种逐 token KV 公式。</p><details class="source" id="src-qwen"><summary><span>源码证据</span>Qwen3.5 按层选择 GDN 或 Full Attention<small>vllm · 2f1041e8dd · L149–164</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/models/qwen3_5.py#L149-L164" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/models/qwen3_5.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 先读层类型分支，再追所选模块的缓存声明；不能给所有层套同一 KV 公式。</span>
+ 149          if self.layer_type == &quot;linear_attention&quot;:
+ 150              self.linear_attn = QwenGatedDeltaNetAttention(
+ 151                  config=config,
+ 152                  vllm_config=vllm_config,
+ 153                  prefix=f&quot;{prefix}.linear_attn&quot;,
+ 154                  gqa_interleaved_layout=False,
+ 155                  reduce_results=not self.use_attn_reduce_scatter_for_moe,
+ 156              )
+ 157          elif self.layer_type == &quot;full_attention&quot;:
+ 158              self.self_attn = Qwen3NextAttention(
+ 159                  config,
+ 160                  model_config=model_config,
+ 161                  cache_config=cache_config,
+ 162                  quant_config=quant_config,
+ 163                  prefix=f&quot;{prefix}.self_attn&quot;,
+ 164                  reduce_results=not self.use_attn_reduce_scatter_for_moe,</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 149          if self.layer_type == &quot;linear_attention&quot;:
+ 150              self.linear_attn = QwenGatedDeltaNetAttention(
+ 151                  config=config,
+ 152                  vllm_config=vllm_config,
+ 153                  prefix=f&quot;{prefix}.linear_attn&quot;,
+ 154                  gqa_interleaved_layout=False,
+ 155                  reduce_results=not self.use_attn_reduce_scatter_for_moe,
+ 156              )
+ 157          elif self.layer_type == &quot;full_attention&quot;:
+ 158              self.self_attn = Qwen3NextAttention(
+ 159                  config,
+ 160                  model_config=model_config,
+ 161                  cache_config=cache_config,
+ 162                  quant_config=quant_config,
+ 163                  prefix=f&quot;{prefix}.self_attn&quot;,
+ 164                  reduce_results=not self.use_attn_reduce_scatter_for_moe,</code></pre></details></details><p>先算一个教学混合模型：共 4 层，其中两层为 GQA，两层保存上述 704 bytes 的状态。GQA 每 token 每层为 64 bytes，block size 为 4；请求有 10 个 token，且全部计算完。无 prefix 共享、无额外状态副本，暂不计状态 padding：</p><pre><code>两层 GQA 的有效 KV：2 × 10 × 64 = 1280 bytes
+两层 GQA 的请求分配容量：2 × ceil(10/4) × 4 × 64 = 1536 bytes
+两层状态内容：2 × 704 = 1408 bytes
+
+有效内容合计：1280 + 1408 = 2688 bytes
+按上述简化分配条件，占用容量：1536 + 1408 = 2944 bytes</code></pre><p>这不是实际混合缓存池的最终分配结果。真实 planner 可能对齐 page、增加状态副本或组织共享 backing；要据实际 config 计算。这个例子只说明：先分别列出每类缓存，再按对应层数求和。MoE 的专家参数量也不能直接代入 KV 容量公式。</p><div class="callout"><b>读完本章，应能先问对三个问题</b><p>这层保存哪些内容？每项内容按 token 追加，还是按窗口、压缩条目、递归状态管理？它的实际 shape、dtype 与保留数量从哪里得到？回答这三个问题以后，再开始算字节数。</p></div></section>
+<footer><a href="kv-cache.html">← 第 1 章</a> · <a href="kv-model-path.html">第 3 章：从配置找到实现 →</a><p><a href="kv-outline.html">KV Cache 完整目录</a> · <a href="THIRD_PARTY_NOTICES.txt">源码归属与许可</a> · <a href="articles.html">原文章索引</a></p></footer></main></div><script src="assets/book/reader.js"></script></body></html>

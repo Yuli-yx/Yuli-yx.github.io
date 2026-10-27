@@ -1,0 +1,252 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="沿 checkpoint、模型注册、层类型和 cache spec，找到当前平台真正使用的缓存实现。"><title>从模型配置找到真实实现｜推理系统源码读本</title><link rel="stylesheet" href="assets/book/styles.css"></head><body><a class="skip" href="#main">跳到正文</a><div id="progress"></div><button id="menu" aria-label="打开目录" aria-expanded="false">☰ 目录</button><aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">kv<span>·</span></span><strong>推理系统源码读本<small>vLLM × vLLM-Ascend</small></strong></a><div class="topic-label">专题导航</div><nav class="topic-nav" aria-label="全站专题"><a href="index.html" >总览 · 推理系统源码读本</a><a href="kv-outline.html" class="selected-topic">KV Cache 管理<small>已写 3 章</small></a><a href="index.html#pd" >P/D 分离<small>规划</small></a><a href="index.html#pool" >KV Pool 池化<small>规划</small></a><a href="index.html#cp" >PCP / DCP<small>规划</small></a><a href="courses/model-runner/index.html" >Model Runner<small>已有</small></a></nav><p class="community-link"><a href="contributing.html">共建说明：要求、计划与接续方法 →</a></p><div class="book-label">KV CACHE 管理 / 第 03 章</div><div class="current-chapter"><strong>从模型配置找到真实实现</strong></div><nav aria-label="本章目录"><a href="#identity">1. 先把模型和运行条件写完整</a><a href="#resolve">2. 用 architectures 找到入口类</a><a href="#layers">3. 在 decoder 层里找 Attention 的分支</a><a href="#spec">4. 从模块追到最终参与规划的 spec</a><a href="#platform">5. 在 Ascend 上再核对 runner 和适配路径</a><a href="#model-map">6. 按模型建立待核对清单</a><a href="#practice">7. 一次源码阅读的完成条件</a></nav><details class="book-outline"><summary>本专题大纲 <span>16 章</span></summary><p><a href="kv-outline.html">查看完整目录与模型案例 →</a></p><ol><li><span>01</span><a href="kv-cache.html">谁在管理 KV Cache？</a><small>已编写</small></li><li><span>02</span><a href="kv-attention.html">Attention 结构决定缓存什么</a><small>已编写</small></li><li><span>03</span><a href="kv-model-path.html" aria-current="page">从模型配置找到真实实现</a><small>本章</small></li><li><span>04</span><a href="kv-outline.html#chapter-04">Cache spec、group 与物理布局</a><small>待写</small></li><li><span>05</span><a href="kv-outline.html#chapter-05">启动时怎样建立缓存池</a><small>待写</small></li><li><span>06</span><a href="kv-outline.html#chapter-06">一轮请求怎样分配、写入和读取</a><small>待写</small></li><li><span>07</span><a href="kv-outline.html#chapter-07">复用、回收与恢复</a><small>待写</small></li><li><span>08</span><a href="kv-outline.html#chapter-08">普通 GQA 模型：完整基线案例</a><small>待写</small></li><li><span>09</span><a href="kv-outline.html#chapter-09">Qwen3.5 / Qwen3.6：Full Attention + GDN</a><small>待写</small></li><li><span>10</span><a href="kv-outline.html#chapter-10">Kimi K3：MLA + KDA</a><small>待写</small></li><li><span>11</span><a href="kv-outline.html#chapter-11">DeepSeek V4：压缩与多类缓存</a><small>待写</small></li><li><span>12</span><a href="kv-outline.html#chapter-12">GLM-5.3：稀疏 Attention 缓存链路</a><small>待写</small></li><li><span>13</span><a href="kv-outline.html#chapter-13">GLM-5.3-Flash：混合 Attention 与辅助状态</a><small>待写</small></li><li><span>14</span><a href="kv-outline.html#chapter-14">同一个请求，在不同模型里会发生什么？</a><small>待写</small></li><li><span>15</span><a href="kv-outline.html#chapter-15">如何算准一个真实模型的缓存容量？</a><small>待写</small></li><li><span>16</span><a href="kv-outline.html#chapter-16">接到系统专题：并行、传输与池化</a><small>待写</small></li></ol></details></aside><div class="page"><header class="topbar"><span><a href="index.html">专题总览</a> / <a href="kv-outline.html">KV Cache 目录</a></span><button id="reading" aria-pressed="false">宽屏阅读</button></header><main id="main"><div class="eyebrow">CHAPTER 03<span>源码 · 例子 · 计算过程</span></div><h1>从模型配置找到真实实现</h1><p class="dek">沿 checkpoint、模型注册、层类型和 cache spec，找到当前平台真正使用的缓存实现。</p><div class="version"><b>源码基线 / 2026.10.25</b><span>vLLM 2f1041e8dd · Ascend e07bf18b76</span><span>章节更新 / 2026.10.27</span></div><div class="intro"><p>同一个商品名可能对应不同尺寸、量化方式或 checkpoint；同一个 architecture 字符串也可能被平台插件映射到不同实现。研究缓存之前，先找到真正被构造的类，再沿类的方法追到 spec。本章给出一条可复用的源码阅读路线。</p><p>以下示例基于固定提交，解释“怎样找到实现”。本章尚未加载各模型的权重，也没有将所有模型家族的参数视为相同。具体 checkpoint 的缓存总账将在后面的模型案例章中填写。</p></div>
+<section id="identity"><h2>1. 先把模型和运行条件写完整</h2><p>只写“Qwen3.6”不足以复现一次缓存规划。至少需要记录 checkpoint 标识与 revision、模型配置、vLLM/Ascend 提交、量化方式、并行配置以及会影响缓存的运行参数。</p><div class="table-wrap"><table><thead><tr><th>需要记录</th><th>为什么影响判断</th></tr></thead><tbody><tr><td>checkpoint、revision、配置文件</td><td>决定 architecture、层数、层类型、head 数、维度和压缩等模型参数。</td></tr><tr><td>两仓 commit 与依赖版本</td><td>同名类的字段和行为可能改变；引用源码时必须固定版本。</td></tr><tr><td>设备、TP/PP/PCP/DCP</td><td>决定当前 rank 执行哪些层，保存哪些 heads、token 或状态。</td></tr><tr><td>权重量化与 cache dtype</td><td>权重用低精度不自动意味着 KV 同样低精度，两者要分别记录。</td></tr><tr><td>block size、prefix caching、投机配置</td><td>可能改变分配粒度、可复用边界、预留空间和状态副本数量。</td></tr><tr><td>实际 runner 与 Attention backend</td><td>决定输入构造、布局适配和缓存读写接口。</td></tr></tbody></table></div><p>记录时区分“用户给的值”与“框架解析后的值”。例如未显式指定的 cache dtype 可能由框架解析；不能把配置中的 auto 当成一种真实存储 dtype。</p></section>
+<section id="resolve"><h2>2. 用 architectures 找到入口类</h2><p>模型加载器读取配置里的 <code>architectures</code>，调用 registry 解析模型类。下面的真实代码是这条路径的起点：</p><details class="source" id="src-resolve"><summary><span>源码证据</span>模型加载器从 architectures 解析类<small>vllm · 2f1041e8dd · L305–313</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/model_loader/utils.py#L305-L313" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/model_loader/utils.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] architectures 用来解析实现类；展示名称本身不足以确定实际执行路径。</span>
+ 305  def _get_model_architecture(model_config: ModelConfig) -&gt; tuple[type[nn.Module], str]:
+ 306      from vllm.model_executor.models.adapters import as_embedding_model, as_seq_cls_model
+ 307
+ 308      architectures = getattr(model_config.hf_config, &quot;architectures&quot;, None) or []
+ 309
+ 310      model_cls, arch = model_config.registry.resolve_model_cls(
+ 311          architectures,
+ 312          model_config=model_config,
+ 313      )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 305  def _get_model_architecture(model_config: ModelConfig) -&gt; tuple[type[nn.Module], str]:
+ 306      from vllm.model_executor.models.adapters import as_embedding_model, as_seq_cls_model
+ 307
+ 308      architectures = getattr(model_config.hf_config, &quot;architectures&quot;, None) or []
+ 309
+ 310      model_cls, arch = model_config.registry.resolve_model_cls(
+ 311          architectures,
+ 312          model_config=model_config,
+ 313      )</code></pre></details></details><p>如果一个配置的 architecture 是 <code>KimiK3ForCausalLM</code>，还需要继续看当前平台注册了什么。Ascend 的注册代码把这个兼容名称映射到 <code>AscendKimiLinearForCausalLM</code>。所以，搜索文件名“kimi_k3”有助于定位，但不能代替查注册映射。</p><details class="source" id="src-register"><summary><span>源码证据</span>Ascend 注册 Kimi 架构与兼容名称<small>vllm-ascend · e07bf18b76 · L8–22</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/models/__init__.py#L8-L22" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/models/__init__.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 注册名称建立架构名与实现类的对应；仍需结合实际 checkpoint 的配置。</span>
+   8      )
+   9      ModelRegistry.register_model(
+  10          &quot;KimiLinearForCausalLM&quot;,
+  11          &quot;vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM&quot;,
+  12      )
+  13      # Keep the release-branch text architecture as a compatibility alias for
+  14      # checkpoints whose config predates vLLM's KimiLinear rename.
+  15      ModelRegistry.register_model(
+  16          &quot;KimiK3ForCausalLM&quot;,
+  17          &quot;vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM&quot;,
+  18      )
+  19      ModelRegistry.register_model(
+  20          &quot;KimiK3ForConditionalGeneration&quot;,
+  21          &quot;vllm_ascend.models.kimi_k3:AscendKimiK3ForConditionalGeneration&quot;,
+  22      )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>   8      )
+   9      ModelRegistry.register_model(
+  10          &quot;KimiLinearForCausalLM&quot;,
+  11          &quot;vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM&quot;,
+  12      )
+  13      # Keep the release-branch text architecture as a compatibility alias for
+  14      # checkpoints whose config predates vLLM's KimiLinear rename.
+  15      ModelRegistry.register_model(
+  16          &quot;KimiK3ForCausalLM&quot;,
+  17          &quot;vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM&quot;,
+  18      )
+  19      ModelRegistry.register_model(
+  20          &quot;KimiK3ForConditionalGeneration&quot;,
+  21          &quot;vllm_ascend.models.kimi_k3:AscendKimiK3ForConditionalGeneration&quot;,
+  22      )</code></pre></details></details><p>这段代码证明注册函数声明了哪些映射。确认某次运行实际使用它，还要确认插件已加载，并继续检查类的构造过程。对于由 Transformers 后端处理的路径，也要遵循加载器选择结果，不能硬套原生模型类。</p><pre><code>checkpoint config.architectures
+  → model_config.registry.resolve_model_cls(...)
+  → 当前环境注册的模型类
+  → 模型 / 多模态包装器中的文本模型
+  → decoder layers</code></pre></section>
+<section id="layers"><h2>3. 在 decoder 层里找 Attention 的分支</h2><p>顶层类名只告诉你模型入口，不能说明每层保存什么。继续查 decoder layer 的构造函数，重点看是否按层号或配置切换 Attention 类型。</p><h3>Qwen3.5：按 layer_type 分支</h3><p>源码明确区分 <code>linear_attention</code> 与 <code>full_attention</code>。前者构造 <code>QwenGatedDeltaNetAttention</code>，后者构造 <code>Qwen3NextAttention</code>。真正有多少层属于各类型，要从所选 checkpoint 的配置展开，不能从这个 if/elif 推断层比例。</p><details class="source" id="src-qwen"><summary><span>源码证据</span>Qwen3.5 按层选择 GDN 或 Full Attention<small>vllm · 2f1041e8dd · L149–164</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/models/qwen3_5.py#L149-L164" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/models/qwen3_5.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 先读层类型分支，再追所选模块的缓存声明；不能给所有层套同一 KV 公式。</span>
+ 149          if self.layer_type == &quot;linear_attention&quot;:
+ 150              self.linear_attn = QwenGatedDeltaNetAttention(
+ 151                  config=config,
+ 152                  vllm_config=vllm_config,
+ 153                  prefix=f&quot;{prefix}.linear_attn&quot;,
+ 154                  gqa_interleaved_layout=False,
+ 155                  reduce_results=not self.use_attn_reduce_scatter_for_moe,
+ 156              )
+ 157          elif self.layer_type == &quot;full_attention&quot;:
+ 158              self.self_attn = Qwen3NextAttention(
+ 159                  config,
+ 160                  model_config=model_config,
+ 161                  cache_config=cache_config,
+ 162                  quant_config=quant_config,
+ 163                  prefix=f&quot;{prefix}.self_attn&quot;,
+ 164                  reduce_results=not self.use_attn_reduce_scatter_for_moe,</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 149          if self.layer_type == &quot;linear_attention&quot;:
+ 150              self.linear_attn = QwenGatedDeltaNetAttention(
+ 151                  config=config,
+ 152                  vllm_config=vllm_config,
+ 153                  prefix=f&quot;{prefix}.linear_attn&quot;,
+ 154                  gqa_interleaved_layout=False,
+ 155                  reduce_results=not self.use_attn_reduce_scatter_for_moe,
+ 156              )
+ 157          elif self.layer_type == &quot;full_attention&quot;:
+ 158              self.self_attn = Qwen3NextAttention(
+ 159                  config,
+ 160                  model_config=model_config,
+ 161                  cache_config=cache_config,
+ 162                  quant_config=quant_config,
+ 163                  prefix=f&quot;{prefix}.self_attn&quot;,
+ 164                  reduce_results=not self.use_attn_reduce_scatter_for_moe,</code></pre></details></details><h3>Kimi K3：按 is_kda_layer(layer_idx) 分支</h3><p>Ascend decoder 调用配置的方法判断某层是否使用 KDA；否则构造 MLA，并在该路径检查 no-RoPE 条件。这样可以确认这份实现存在两种缓存需求，但实际层数、维度和层分布仍由具体配置决定。</p><details class="source" id="src-kimi"><summary><span>源码证据</span>Kimi decoder 选择 KDA 或 no-RoPE MLA<small>vllm-ascend · e07bf18b76 · L503–545</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/models/kimi_k3.py#L503-L545" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/models/kimi_k3.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 本段按配置选择 KDA 或 MLA 路径；具体层的选择还需核对模型配置。</span>
+ 503          self,
+ 504          config,
+ 505          vllm_config: VllmConfig,
+ 506          prefix: str = &quot;&quot;,
+ 507          use_sequence_parallel: bool = False,
+ 508      ) -&gt; None:
+ 509          &quot;&quot;&quot;Select KDA or no-RoPE MLA and configure the layer residual path.&quot;&quot;&quot;
+ 510          nn.Module.__init__(self)
+ 511          self.hidden_size = config.hidden_size
+ 512          self.layer_idx = int(prefix.rsplit(&quot;.&quot;, 1)[1])
+ 513          self.is_moe = config.is_moe
+ 514          self.use_sequence_parallel = use_sequence_parallel
+ 515          layer_idx = self.layer_idx
+ 516          cache_config = vllm_config.cache_config
+ 517          quant_config = vllm_config.quant_config
+ 518
+ 519          if config.is_kda_layer(layer_idx):
+ 520              self.self_attn = AscendKimiK3DeltaAttention(
+ 521                  config,
+ 522                  vllm_config,
+ 523                  prefix=f&quot;{prefix}.self_attn&quot;,
+ 524              )
+ 525          else:
+ 526              qk_nope_head_dim = config.qk_nope_head_dim
+ 527              qk_rope_head_dim = config.qk_rope_head_dim
+ 528              v_head_dim = config.v_head_dim
+ 529              kv_lora_rank = config.kv_lora_rank
+ 530              assert qk_nope_head_dim is not None
+ 531              assert qk_rope_head_dim is not None
+ 532              assert v_head_dim is not None
+ 533              assert kv_lora_rank is not None
+ 534              assert config.mla_use_nope is True
+ 535              self.self_attn = AscendKimiMLAAttention(
+ 536                  config=config,
+ 537                  hidden_size=self.hidden_size,
+ 538                  num_heads=config.num_attention_heads,
+ 539                  qk_nope_head_dim=qk_nope_head_dim,
+ 540                  qk_rope_head_dim=qk_rope_head_dim,
+ 541                  v_head_dim=v_head_dim,
+ 542                  q_lora_rank=config.q_lora_rank,
+ 543                  kv_lora_rank=kv_lora_rank,
+ 544                  use_output_gate=bool(config.mla_use_output_gate),
+ 545                  use_rope=False,</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 503          self,
+ 504          config,
+ 505          vllm_config: VllmConfig,
+ 506          prefix: str = &quot;&quot;,
+ 507          use_sequence_parallel: bool = False,
+ 508      ) -&gt; None:
+ 509          &quot;&quot;&quot;Select KDA or no-RoPE MLA and configure the layer residual path.&quot;&quot;&quot;
+ 510          nn.Module.__init__(self)
+ 511          self.hidden_size = config.hidden_size
+ 512          self.layer_idx = int(prefix.rsplit(&quot;.&quot;, 1)[1])
+ 513          self.is_moe = config.is_moe
+ 514          self.use_sequence_parallel = use_sequence_parallel
+ 515          layer_idx = self.layer_idx
+ 516          cache_config = vllm_config.cache_config
+ 517          quant_config = vllm_config.quant_config
+ 518
+ 519          if config.is_kda_layer(layer_idx):
+ 520              self.self_attn = AscendKimiK3DeltaAttention(
+ 521                  config,
+ 522                  vllm_config,
+ 523                  prefix=f&quot;{prefix}.self_attn&quot;,
+ 524              )
+ 525          else:
+ 526              qk_nope_head_dim = config.qk_nope_head_dim
+ 527              qk_rope_head_dim = config.qk_rope_head_dim
+ 528              v_head_dim = config.v_head_dim
+ 529              kv_lora_rank = config.kv_lora_rank
+ 530              assert qk_nope_head_dim is not None
+ 531              assert qk_rope_head_dim is not None
+ 532              assert v_head_dim is not None
+ 533              assert kv_lora_rank is not None
+ 534              assert config.mla_use_nope is True
+ 535              self.self_attn = AscendKimiMLAAttention(
+ 536                  config=config,
+ 537                  hidden_size=self.hidden_size,
+ 538                  num_heads=config.num_attention_heads,
+ 539                  qk_nope_head_dim=qk_nope_head_dim,
+ 540                  qk_rope_head_dim=qk_rope_head_dim,
+ 541                  v_head_dim=v_head_dim,
+ 542                  q_lora_rank=config.q_lora_rank,
+ 543                  kv_lora_rank=kv_lora_rank,
+ 544                  use_output_gate=bool(config.mla_use_output_gate),
+ 545                  use_rope=False,</code></pre></details></details><p>后面每个模型章都要列出“层号 → 模块类型 → cache 对象”的表。参数共享或多个缓存模块可能让两者不是简单的一对一关系，因此不能只统计 decoder layer 数。</p></section>
+<section id="spec"><h2>4. 从模块追到最终参与规划的 spec</h2><p>找到 Attention 模块后，继续读 <code>get_kv_cache_spec()</code>。这个方法可能定义在当前类，也可能继承自父类。若只在当前文件搜索不到，不应就此认定它没有缓存。</p><p>Qwen GDN 的 <code>get_state_shape()</code> 把 TP、K/V head 数、各自维度、卷积核大小和 speculative 参数传给状态 shape 计算器。这些参数能告诉我们接下来要核对哪些配置；真正的各项 shape 还需要读计算器的返回值。</p><details class="source" id="src-state-shape"><summary><span>源码证据</span>Qwen GDN 状态 shape 的配置入口<small>vllm · 2f1041e8dd · L543–556</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py#L543-L556" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 状态 shape 的来源在这里；统计容量时还要核对 dtype 和并行切分。</span>
+ 543  @PluggableLayer.register(&quot;qwen_gated_delta_net_attention&quot;)
+ 544  class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+ 545      def get_state_shape(
+ 546          self,
+ 547      ) -&gt; tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+ 548          return MambaStateShapeCalculator.gated_delta_net_state_shape(
+ 549              self.tp_size,
+ 550              self.num_k_heads,
+ 551              self.num_v_heads,
+ 552              self.head_k_dim,
+ 553              self.head_v_dim,
+ 554              self.conv_kernel_size,
+ 555              self.num_spec,
+ 556          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 543  @PluggableLayer.register(&quot;qwen_gated_delta_net_attention&quot;)
+ 544  class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
+ 545      def get_state_shape(
+ 546          self,
+ 547      ) -&gt; tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+ 548          return MambaStateShapeCalculator.gated_delta_net_state_shape(
+ 549              self.tp_size,
+ 550              self.num_k_heads,
+ 551              self.num_v_heads,
+ 552              self.head_k_dim,
+ 553              self.head_v_dim,
+ 554              self.conv_kernel_size,
+ 555              self.num_spec,
+ 556          )</code></pre></details></details><p>上游 V2 收集 spec 时，遍历注册到配置中的 AttentionLayerBase 模块，以 layer name 保存结果。代码会跳过共享目标层，忽略返回 None 的模块，并让 Attention backend 进一步定制 AttentionSpec。它还可能标记 draft 层或解析特殊缓存配置。</p><details class="source" id="src-collect"><summary><span>源码证据</span>上游 V2 收集并定制缓存 spec<small>vllm · 2f1041e8dd · L138–155</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/attn_utils.py#L138-L155" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/gpu/attn_utils.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 收集模块声明后还可能经过 backend 定制，模块最初返回的 spec 未必是最终布局。</span>
+ 138  def get_kv_cache_spec(vllm_config: VllmConfig) -&gt; dict[str, KVCacheSpec]:
+ 139      kv_cache_spec: dict[str, KVCacheSpec] = {}
+ 140      layer_type = cast(type[Any], AttentionLayerBase)
+ 141      attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
+ 142      for layer_name, attn_module in attn_layers.items():
+ 143          if getattr(attn_module, &quot;kv_sharing_target_layer_name&quot;, None):
+ 144              # This layer will use KV cache of the sharing target layer.
+ 145              continue
+ 146          # Skip modules that don't need KV cache (eg encoder-only attention)
+ 147          if spec := attn_module.get_kv_cache_spec(vllm_config):
+ 148              if isinstance(spec, AttentionSpec):
+ 149                  spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
+ 150              if attn_module.is_draft_layer:
+ 151                  spec = replace(spec, is_draft=True)
+ 152              kv_cache_spec[layer_name] = spec
+ 153      if vllm_config.attention_config.hisparse_config is not None:
+ 154          kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)
+ 155      return kv_cache_spec</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 138  def get_kv_cache_spec(vllm_config: VllmConfig) -&gt; dict[str, KVCacheSpec]:
+ 139      kv_cache_spec: dict[str, KVCacheSpec] = {}
+ 140      layer_type = cast(type[Any], AttentionLayerBase)
+ 141      attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)
+ 142      for layer_name, attn_module in attn_layers.items():
+ 143          if getattr(attn_module, &quot;kv_sharing_target_layer_name&quot;, None):
+ 144              # This layer will use KV cache of the sharing target layer.
+ 145              continue
+ 146          # Skip modules that don't need KV cache (eg encoder-only attention)
+ 147          if spec := attn_module.get_kv_cache_spec(vllm_config):
+ 148              if isinstance(spec, AttentionSpec):
+ 149                  spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
+ 150              if attn_module.is_draft_layer:
+ 151                  spec = replace(spec, is_draft=True)
+ 152              kv_cache_spec[layer_name] = spec
+ 153      if vllm_config.attention_config.hisparse_config is not None:
+ 154          kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)
+ 155      return kv_cache_spec</code></pre></details></details><div class="callout"><b>区分原始声明与最终规划输入</b><p>某个模块的 get_kv_cache_spec 返回值，只是追踪过程中的一个节点。Backend 定制、平台适配和后续缓存规划可能继续改变字段。模型章节既要展示原始 spec，也要说明哪些步骤把它变成最终 config。</p></div><p>记录一项缓存时，可使用下面的空表。没有读取到的值写“待核对”，不要根据名称补全。</p><div class="table-wrap"><table><thead><tr><th>字段</th><th>从哪里确认</th></tr></thead><tbody><tr><td>layer/module name、类名</td><td>构造路径、prefix，以及实际注册的模块。</td></tr><tr><td>原始 spec 与定制后的 spec</td><td>get_kv_cache_spec、backend customize 和平台适配。</td></tr><tr><td>shape、dtype、page bytes</td><td>spec 字段、状态 shape 计算器、page 字节数属性。</td></tr><tr><td>保留策略与缓存组</td><td>planner、coordinator 和对应类型的 manager。</td></tr><tr><td>物理 tensor/view 与读写接口</td><td>worker 分配和绑定路径、backend/cache writer。</td></tr></tbody></table></div></section>
+<section id="platform"><h2>5. 在 Ascend 上再核对 runner 和适配路径</h2><p>Ascend 可以通过模型注册、层替换、继承覆盖和 patch 改变上游执行路径。看到上游有某个实现，并不能证明这次 NPU 运行直接执行它。</p><p>当前源码的 runner 选择 patch 默认优先 V2，允许环境显式选择 V1，也会按配置中的特性限制回退。因此，V1 Engine、V1/V2 Model Runner、以及文件名中的 attention_v1 不能当作同一套版本编号。</p><details class="source" id="src-runner"><summary><span>源码证据</span>Ascend 默认 runner 选择入口<small>vllm-ascend · e07bf18b76 · L1–8</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/patch/platform/patch_use_v2_model_runner.py#L1-L8" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/patch/platform/patch_use_v2_model_runner.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 这段修改 runner 的选择入口；还要沿选中的 runner 继续追分配和绑定过程。</span>
+   1  from vllm.config.vllm import VllmConfig
+   2
+   3  from vllm_ascend.mrv2_utils import apply_v2_model_runner_config_patch
+   4
+   5  # Default to the Ascend V2 runner unless the environment explicitly selects
+   6  # V1, or the config hits the V2 feature blacklist.
+   7  apply_v2_model_runner_config_patch()
+   8  </code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>   1  from vllm.config.vllm import VllmConfig
+   2
+   3  from vllm_ascend.mrv2_utils import apply_v2_model_runner_config_patch
+   4
+   5  # Default to the Ascend V2 runner unless the environment explicitly selects
+   6  # V1, or the config hits the V2 feature blacklist.
+   7  apply_v2_model_runner_config_patch()
+   8  </code></pre></details></details><p>确认 runner 后，再找它调用的 spec 收集、缓存分配、block table 更新和 Attention metadata 构造方法。若某个方法继承上游，记录父类路径；若覆盖了它，比较实际改动。后续模型案例会把“上游机制”和“Ascend 差异”分别列出，避免同一段解释里来回切换却不说明对象。</p></section>
+<section id="model-map"><h2>6. 按模型建立待核对清单</h2><p>目前已经在固定源码中找到以下入口。这里列的是后续章节的查证路线，不是各模型的完整配置结论。</p><div class="table-wrap"><table><thead><tr><th>模型案例</th><th>已有源码线索</th><th>下一步要确认</th></tr></thead><tbody><tr><td>Qwen3.5 / 3.6</td><td>Qwen3.5 的 GDN / Full Attention 分支；仓库有 Qwen3.6 部署文档。</td><td>为两个具体 checkpoint 核对 architecture、层类型分布和状态尺寸。</td></tr><tr><td>Kimi K3</td><td>KDA / no-RoPE MLA 分支与 architecture 别名。</td><td>所选配置的层分布、MLA latent 维度和 KDA 状态。</td></tr><tr><td>DeepSeek V4</td><td>模型、compressor、indexer 各有缓存相关实现。</td><td>逐项展开主缓存、压缩缓存和 compressor state；与 V4.1 分开。</td></tr><tr><td>GLM-5.3</td><td>仓库有与 GLM-5.2 共用的部署说明及 DSA 相关入口。</td><td>从 checkpoint 确认架构映射，跟到主 Attention 和 indexer。</td></tr><tr><td>GLM-5.3-Flash</td><td>glm5next 下有 KDA、indexer cache 与 tail ring 等组件。</td><td>确认各组件何时创建、如何分组、状态保存多久。</td></tr></tbody></table></div><p>这些案例里会出现两个容易混淆的名称：模型 indexer 内部的 KPool 和跨实例 KV Pool 池化。必须根据对象与调用路径解释，不能因为名字相近就把它们归为同一个系统。</p></section>
+<section id="practice"><h2>7. 一次源码阅读的完成条件</h2><p>读完一个模型的缓存实现后，应能用可核对的配置回答以下问题，而不只是报出一个 spec 类名：</p><ol><li>哪个 checkpoint 在当前平台解析成哪个模型类？</li><li>每种 Attention 层及辅助组件分别保存什么？</li><li>哪些字段来自模型配置，哪些来自运行参数或 backend 定制？</li><li>spec 怎样进入 group 和物理分配？</li><li>每个 tensor 的内容、shape、dtype、有效范围与生命周期是什么？</li></ol><p>如果只完成静态阅读，就把结论限定为静态源码分析。需要运行才能确认的分支、布局或内存开销，留作明确的验证项。第 4 章将继续沿 spec 往下追踪，解释 group、page 与物理布局。</p></section>
+<footer><a href="kv-attention.html">← 第 2 章</a> · <a href="kv-outline.html#chapter-04">第 4 章规划 →</a><p><a href="kv-outline.html">KV Cache 完整目录</a> · <a href="THIRD_PARTY_NOTICES.txt">源码归属与许可</a> · <a href="articles.html">原文章索引</a></p></footer></main></div><script src="assets/book/reader.js"></script></body></html>

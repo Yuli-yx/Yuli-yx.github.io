@@ -1,0 +1,134 @@
+{
+  "ordinary": {
+    "repo": "vllm",
+    "path": "vllm/model_executor/layers/attention/attention.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 608,
+    "end": 619,
+    "title": "普通 Attention 按类型决定是否声明缓存",
+    "file_sha256": "ded9678e3aa149c66cbe1d31e4fbb9a758198a35f1d31a4af45eaf52209143af",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/attention/attention.py#L608-L619",
+    "code": " 608      def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:\n 609          # Block size may get updated after model loading, refresh it\n 610          block_size = vllm_config.cache_config.block_size\n 611          # Encoder-only attention is prefill-only and keeps no autoregressive KV\n 612          # cache. In hybrid models (e.g. Qwen3.5 / ColQwen3.5: GatedDeltaNet\n 613          # linear_attention interleaved with full_attention) the runner iterates\n 614          # every attention module to build the KV-cache spec, so an ENCODER_ONLY\n 615          # full_attention layer reaches here; it contributes no KV cache group.\n 616          if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):\n 617              return None\n 618          # Should not be called for enc-dec attention.\n 619          assert self.attn_type == AttentionType.DECODER"
+  },
+  "mla": {
+    "repo": "vllm",
+    "path": "vllm/model_executor/layers/attention/mla_attention.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 1371,
+    "end": 1401,
+    "title": "MLA 的缓存 spec 与打包格式字节数",
+    "file_sha256": "af3300b09fda788591861cff8f59ef2d41b02f17164763647d75f33330406f0d",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/attention/mla_attention.py#L1371-L1401",
+    "code": "1371      def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n1372          kv_cache_dtype = kv_cache_dtype_str_to_dtype(\n1373              self.kv_cache_dtype, vllm_config.model_config\n1374          )\n1375          common_kwargs = dict(\n1376              block_size=vllm_config.cache_config.block_size,\n1377              num_kv_heads=1,\n1378              max_tp_shards=1,\n1379              head_size=self.head_size,\n1380              dtype=kv_cache_dtype,\n1381              cache_dtype_str=self.kv_cache_dtype,\n1382              kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),\n1383              # ds_mla layouts pack NoPE + RoPE + scales into one opaque per-token\n1384              # blob, so the size is not derivable from head_size.\n1385              # See flashmla_sparse.py.\n1386              state_content_bytes={\"fp8_ds_mla\": 656, \"nvfp4_ds_mla\": 352}.get(\n1387                  self.kv_cache_dtype\n1388              ),\n1389          )\n1390          if self.sliding_window is not None:\n1391              return SlidingWindowMLASpec(\n1392                  **common_kwargs,\n1393                  sliding_window=self.sliding_window,\n1394              )\n1395          spec = MLAAttentionSpec(\n1396              **common_kwargs,\n1397              topk_buffer_width=self.topk_buffer_width,\n1398              is_index_group_leader=self.indexer is not None,\n1399              non_causal_multi_token_decode=self.non_causal_multi_token_decode,\n1400          )\n1401          return spec"
+  },
+  "mamba": {
+    "repo": "vllm",
+    "path": "vllm/v1/kv_cache_interface.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 1079,
+    "end": 1128,
+    "title": "MambaSpec 按 shape 与 dtype 计算状态容量",
+    "file_sha256": "84dbe7cee4fd2b3cea36134f41f6c940f36d35f5a99b21b14c26d1057fc11853",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L1079-L1128",
+    "code": "1079  class MambaSpec(KVCacheSpec):\n1080      shapes: tuple[tuple[int, ...], ...]\n1081      dtypes: tuple[torch.dtype, ...]\n1082      page_size_padded: int | None = None\n1083      mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2\n1084      mamba_cache_mode: str = \"none\"\n1085      num_speculative_blocks: int = 0\n1086      num_prefill_checkpoint_blocks: int = 0\n1087      prefill_checkpoint_alignment: int | None = None\n1088      num_heads: int = 1\n1089      tokens_per_state: int = -1\n1090      # False: the state is sharded across TP ranks (e.g. GDN). True: every TP\n1091      # rank holds the full state (e.g. the replicated PLE conv state).\n1092      tp_replicated: bool = False\n1093  \n1094      @property\n1095      def state_content_size_bytes(self) -> int:\n1096          return sum(\n1097              prod(shape) * get_dtype_size(dtype)\n1098              for (shape, dtype) in zip(self.shapes, self.dtypes)\n1099          )\n1100  \n1101      @property\n1102      def real_page_size_bytes(self) -> int:\n1103          return self.state_content_size_bytes\n1104  \n1105      @property\n1106      def page_size_bytes(self) -> int:\n1107          page_size = sum(\n1108              prod(shape) * get_dtype_size(dtype)\n1109              for (shape, dtype) in zip(self.shapes, self.dtypes)\n1110          )\n1111          if self.page_size_padded is not None:\n1112              assert self.page_size_padded >= page_size\n1113              return self.page_size_padded\n1114          return page_size\n1115  \n1116      @property\n1117      def block_table_token_alignment(self) -> int | None:\n1118          return None\n1119  \n1120      def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:\n1121          if vllm_config.cache_config.mamba_cache_mode == \"align\":\n1122              return self.page_size_bytes * (\n1123                  2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks\n1124              )\n1125          else:\n1126              return self.page_size_bytes * (1 + self.num_speculative_blocks)\n1127  \n1128      def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -> int:"
+  },
+  "checkpoint": {
+    "repo": "vllm",
+    "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 739,
+    "end": 750,
+    "title": "Qwen GDN 按条件增加 checkpoint 声明",
+    "file_sha256": "944a3a893d44fa94482eef2d52a26b544eb01ac5b0a99ed4b72fb3c3853a14f7",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py#L739-L750",
+    "code": " 739      def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:\n 740          spec = super().get_kv_cache_spec(vllm_config)\n 741          if not self._exports_checkpoints or not isinstance(spec, MambaSpec):\n 742              return spec\n 743          # FlashInfer emits states at one stride for the whole batch, the gcd of\n 744          # the offsets; keeping every offset on the prefix-cache grid keeps that\n 745          # stride a multiple of the grid, which bounds the states emitted.\n 746          return replace(\n 747              spec,\n 748              num_prefill_checkpoint_blocks=1,\n 749              prefill_checkpoint_alignment=get_mamba_prefill_checkpoint_grid(vllm_config),\n 750          )"
+  },
+  "qwen": {
+    "repo": "vllm",
+    "path": "vllm/model_executor/models/qwen3_5.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 149,
+    "end": 164,
+    "title": "Qwen3.5 按层选择 GDN 或 Full Attention",
+    "file_sha256": "ea7e71303c902b9678e85ff3e9a75a7ab6e69b5770605d540ad6ab1084e18187",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/models/qwen3_5.py#L149-L164",
+    "code": " 149          if self.layer_type == \"linear_attention\":\n 150              self.linear_attn = QwenGatedDeltaNetAttention(\n 151                  config=config,\n 152                  vllm_config=vllm_config,\n 153                  prefix=f\"{prefix}.linear_attn\",\n 154                  gqa_interleaved_layout=False,\n 155                  reduce_results=not self.use_attn_reduce_scatter_for_moe,\n 156              )\n 157          elif self.layer_type == \"full_attention\":\n 158              self.self_attn = Qwen3NextAttention(\n 159                  config,\n 160                  model_config=model_config,\n 161                  cache_config=cache_config,\n 162                  quant_config=quant_config,\n 163                  prefix=f\"{prefix}.self_attn\",\n 164                  reduce_results=not self.use_attn_reduce_scatter_for_moe,"
+  },
+  "ds-index": {
+    "repo": "vllm-ascend",
+    "path": "vllm_ascend/models/deepseek_v4/indexer.py",
+    "commit": "e07bf18b76ce8543baffafa9ba868e86305d15b2",
+    "start": 147,
+    "end": 170,
+    "title": "DSV4 indexer 的压缩关系与 spec",
+    "file_sha256": "07809fd710b734cccef641d47d8bbf6ad8ab9192a2a4af1306413215a457eb10",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/models/deepseek_v4/indexer.py#L147-L170",
+    "code": " 147      def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n 148          from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec\n 149          from vllm_ascend.models.layer.attention.layer import DSV4_BLOCK_SIZES\n 150  \n 151          storage_block_size = DSV4_BLOCK_SIZES[vllm_config.cache_config.block_size][0][0]\n 152          # vLLM #51718 replaced MLAAttentionSpec.compress_ratio with\n 153          # AttentionSpec.tokens_per_state on main.\n 154          ratio_kwargs = {\"tokens_per_state\": self.compress_ratio}\n 155          return AscendMLAAttentionSpec(\n 156              block_size=storage_block_size * self.compress_ratio,\n 157              num_kv_heads=1,\n 158              head_size=self.head_dim,\n 159              dtype=self.dtype,\n 160              model_version=\"deepseek_v4\",\n 161              cache_dtype_str=self.cache_config.cache_dtype,\n 162              scale_dim=1 if self.head_dim == 128 else 0,\n 163              scale_dtype=torch.float\n 164              if get_current_hardware_profile().supports(HardwareCapability.DSV4_COMPRESSED_CACHE)\n 165              else torch.float16,\n 166              **ratio_kwargs,\n 167          )\n 168  \n 169      def forward(self): ...\n 170  "
+  },
+  "resolve": {
+    "repo": "vllm",
+    "path": "vllm/model_executor/model_loader/utils.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 305,
+    "end": 313,
+    "title": "模型加载器从 architectures 解析类",
+    "file_sha256": "f81091610299bd1a18333a1d7cd3cce7bf35211e82ae8cb05ad381e79f15554f",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/model_loader/utils.py#L305-L313",
+    "code": " 305  def _get_model_architecture(model_config: ModelConfig) -> tuple[type[nn.Module], str]:\n 306      from vllm.model_executor.models.adapters import as_embedding_model, as_seq_cls_model\n 307  \n 308      architectures = getattr(model_config.hf_config, \"architectures\", None) or []\n 309  \n 310      model_cls, arch = model_config.registry.resolve_model_cls(\n 311          architectures,\n 312          model_config=model_config,\n 313      )"
+  },
+  "register": {
+    "repo": "vllm-ascend",
+    "path": "vllm_ascend/models/__init__.py",
+    "commit": "e07bf18b76ce8543baffafa9ba868e86305d15b2",
+    "start": 8,
+    "end": 22,
+    "title": "Ascend 注册 Kimi 架构与兼容名称",
+    "file_sha256": "0b2eb26fe39ac411954344bc11cd04ad64dc8a2e053ead42467c0249b2d1a248",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/models/__init__.py#L8-L22",
+    "code": "   8      )\n   9      ModelRegistry.register_model(\n  10          \"KimiLinearForCausalLM\",\n  11          \"vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM\",\n  12      )\n  13      # Keep the release-branch text architecture as a compatibility alias for\n  14      # checkpoints whose config predates vLLM's KimiLinear rename.\n  15      ModelRegistry.register_model(\n  16          \"KimiK3ForCausalLM\",\n  17          \"vllm_ascend.models.kimi_k3:AscendKimiLinearForCausalLM\",\n  18      )\n  19      ModelRegistry.register_model(\n  20          \"KimiK3ForConditionalGeneration\",\n  21          \"vllm_ascend.models.kimi_k3:AscendKimiK3ForConditionalGeneration\",\n  22      )"
+  },
+  "kimi": {
+    "repo": "vllm-ascend",
+    "path": "vllm_ascend/models/kimi_k3.py",
+    "commit": "e07bf18b76ce8543baffafa9ba868e86305d15b2",
+    "start": 503,
+    "end": 545,
+    "title": "Kimi decoder 选择 KDA 或 no-RoPE MLA",
+    "file_sha256": "17f5cf38d3a4eb9977d13cf4a1e4acbeef353dcf58b014b51a7a504dd0b3a622",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/models/kimi_k3.py#L503-L545",
+    "code": " 503          self,\n 504          config,\n 505          vllm_config: VllmConfig,\n 506          prefix: str = \"\",\n 507          use_sequence_parallel: bool = False,\n 508      ) -> None:\n 509          \"\"\"Select KDA or no-RoPE MLA and configure the layer residual path.\"\"\"\n 510          nn.Module.__init__(self)\n 511          self.hidden_size = config.hidden_size\n 512          self.layer_idx = int(prefix.rsplit(\".\", 1)[1])\n 513          self.is_moe = config.is_moe\n 514          self.use_sequence_parallel = use_sequence_parallel\n 515          layer_idx = self.layer_idx\n 516          cache_config = vllm_config.cache_config\n 517          quant_config = vllm_config.quant_config\n 518  \n 519          if config.is_kda_layer(layer_idx):\n 520              self.self_attn = AscendKimiK3DeltaAttention(\n 521                  config,\n 522                  vllm_config,\n 523                  prefix=f\"{prefix}.self_attn\",\n 524              )\n 525          else:\n 526              qk_nope_head_dim = config.qk_nope_head_dim\n 527              qk_rope_head_dim = config.qk_rope_head_dim\n 528              v_head_dim = config.v_head_dim\n 529              kv_lora_rank = config.kv_lora_rank\n 530              assert qk_nope_head_dim is not None\n 531              assert qk_rope_head_dim is not None\n 532              assert v_head_dim is not None\n 533              assert kv_lora_rank is not None\n 534              assert config.mla_use_nope is True\n 535              self.self_attn = AscendKimiMLAAttention(\n 536                  config=config,\n 537                  hidden_size=self.hidden_size,\n 538                  num_heads=config.num_attention_heads,\n 539                  qk_nope_head_dim=qk_nope_head_dim,\n 540                  qk_rope_head_dim=qk_rope_head_dim,\n 541                  v_head_dim=v_head_dim,\n 542                  q_lora_rank=config.q_lora_rank,\n 543                  kv_lora_rank=kv_lora_rank,\n 544                  use_output_gate=bool(config.mla_use_output_gate),\n 545                  use_rope=False,"
+  },
+  "state-shape": {
+    "repo": "vllm",
+    "path": "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 543,
+    "end": 556,
+    "title": "Qwen GDN 状态 shape 的配置入口",
+    "file_sha256": "944a3a893d44fa94482eef2d52a26b544eb01ac5b0a99ed4b72fb3c3853a14f7",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py#L543-L556",
+    "code": " 543  @PluggableLayer.register(\"qwen_gated_delta_net_attention\")\n 544  class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):\n 545      def get_state_shape(\n 546          self,\n 547      ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:\n 548          return MambaStateShapeCalculator.gated_delta_net_state_shape(\n 549              self.tp_size,\n 550              self.num_k_heads,\n 551              self.num_v_heads,\n 552              self.head_k_dim,\n 553              self.head_v_dim,\n 554              self.conv_kernel_size,\n 555              self.num_spec,\n 556          )"
+  },
+  "collect": {
+    "repo": "vllm",
+    "path": "vllm/v1/worker/gpu/attn_utils.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 138,
+    "end": 155,
+    "title": "上游 V2 收集并定制缓存 spec",
+    "file_sha256": "705a1eb16d26dc0ec658af9e10e00831f16d1925c14361228853807e456f6553",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/attn_utils.py#L138-L155",
+    "code": " 138  def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:\n 139      kv_cache_spec: dict[str, KVCacheSpec] = {}\n 140      layer_type = cast(type[Any], AttentionLayerBase)\n 141      attn_layers = get_layers_from_vllm_config(vllm_config, layer_type)\n 142      for layer_name, attn_module in attn_layers.items():\n 143          if getattr(attn_module, \"kv_sharing_target_layer_name\", None):\n 144              # This layer will use KV cache of the sharing target layer.\n 145              continue\n 146          # Skip modules that don't need KV cache (eg encoder-only attention)\n 147          if spec := attn_module.get_kv_cache_spec(vllm_config):\n 148              if isinstance(spec, AttentionSpec):\n 149                  spec = customize_attention_spec(attn_module.get_attn_backend(), spec)\n 150              if attn_module.is_draft_layer:\n 151                  spec = replace(spec, is_draft=True)\n 152              kv_cache_spec[layer_name] = spec\n 153      if vllm_config.attention_config.hisparse_config is not None:\n 154          kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)\n 155      return kv_cache_spec"
+  },
+  "runner": {
+    "repo": "vllm-ascend",
+    "path": "vllm_ascend/patch/platform/patch_use_v2_model_runner.py",
+    "commit": "e07bf18b76ce8543baffafa9ba868e86305d15b2",
+    "start": 1,
+    "end": 8,
+    "title": "Ascend 默认 runner 选择入口",
+    "file_sha256": "9a33f8f8e11ad6a198e95916fca4a4ad44c1e0cbf0032d1629cb1764cacb81d8",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/patch/platform/patch_use_v2_model_runner.py#L1-L8",
+    "code": "   1  from vllm.config.vllm import VllmConfig\n   2  \n   3  from vllm_ascend.mrv2_utils import apply_v2_model_runner_config_patch\n   4  \n   5  # Default to the Ascend V2 runner unless the environment explicitly selects\n   6  # V1, or the config hits the V2 feature blacklist.\n   7  apply_v2_model_runner_config_patch()\n   8  "
+  }
+}

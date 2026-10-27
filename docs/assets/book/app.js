@@ -11,7 +11,7 @@ q('#tensor-target').textContent=`Layer ${layer} · 普通 K/V 示意视图 [N,B,
 q('#phase-note').textContent=st.note;
 }
 q('#phase').onchange=e=>{phase=Number(e.target.value);position=phases[phase].positions[0];render()};q('#layer').onchange=e=>{layer=Number(e.target.value);render()};render();
-const links=[...document.querySelectorAll('nav a')],sections=[...document.querySelectorAll('main section')];
+const links=[...document.querySelectorAll('nav[aria-label="本章目录"] a')],sections=[...document.querySelectorAll('main section')];
 function update(){const max=document.documentElement.scrollHeight-innerHeight;q('#progress').style.width=(max>0?Math.min(100,scrollY/max*100):0)+'%';let current=sections[0];for(const s of sections){if(s.getBoundingClientRect().top<160)current=s}links.forEach(a=>{const on=a.hash==='#'+current.id;a.classList.toggle('active',on);if(on)a.setAttribute('aria-current','location');else a.removeAttribute('aria-current')})}addEventListener('scroll',update,{passive:true});addEventListener('resize',update);update();
 q('#menu').onclick=()=>{const open=q('.sidebar').classList.toggle('open');q('#menu').setAttribute('aria-expanded',String(open));q('#menu').textContent=open?'关闭目录':'☰ 目录'};links.forEach(a=>a.addEventListener('click',()=>{q('.sidebar').classList.remove('open');q('#menu').setAttribute('aria-expanded','false');q('#menu').textContent='☰ 目录'}));
 q('#reading').onclick=()=>{const wide=document.body.classList.toggle('wide');q('#reading').setAttribute('aria-pressed',String(wide));q('#reading').textContent=wide?'标准阅读':'宽屏阅读'};

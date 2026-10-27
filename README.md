@@ -48,3 +48,13 @@ npm run preview
 - 明确区分有效数据量、请求分配容量和缓存池容量；说明尾块、共享和预留的影响。
 - 使用具体 tensor shape 或状态表交叉核对，标注教学假设与真实实现的差异。
 - 保留源码证据；不能把简化例子的结论直接推广到量化、MLA、混合缓存或并行模式。
+
+## KV Cache 新版章节
+
+`content/book/curriculum.json` 是 16 章目录的唯一数据源。`scripts/build-book.mjs` 生成专题目录、各章导航与页面；第一章保留完整 HTML，第 2、3 章正文位于 `content/book/chapters/`。新章源码节选在 `model-sources.json`，保存固定 commit、行号和源文件 SHA256。
+
+写作参考 [plain-chinese-writing](https://github.com/yiz-liu/plain-chinese-writing)：先说明主体和条件，逐步展开计算；保留技术名称和证据范围，不以删减必要解释换取简短。本站当前已编写 1–3 章，其余模型案例和机制章节仍为待写。
+
+## 贡献与接续
+
+统一要求和计划见 [共建说明](https://yuli-yx.github.io/contributing.html)，源文件为 `content/book/contributing.html`。修改需求时同步此页。中文源码注释由 `annotations.json` 单独维护，保留原始摘录与行号；不得把讲解补充冒充上游原文。

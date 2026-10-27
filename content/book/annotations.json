@@ -1,0 +1,106 @@
+{
+  "block": {
+    "before_line": 166,
+    "text": "物理 block 的编号；对象记录身份和引用关系，不保存 K/V 数值。"
+  },
+  "groups": {
+    "before_line": 35,
+    "text": "先区分 cache group，再看请求在该组中的逻辑 block 顺序。"
+  },
+  "alloc": {
+    "before_line": 596,
+    "text": "这里分配底层字节存储；各层的 tensor 视图还要在后续代码中建立。"
+  },
+  "table": {
+    "before_line": 90,
+    "text": "slot mapping 按 group 和本轮 token 保存写入位置；它不是 K/V 数据。"
+  },
+  "append": {
+    "before_line": 132,
+    "text": "追加从已有 block 数开始；overwrite 时从表头重写。"
+  },
+  "gather": {
+    "before_line": 160,
+    "text": "请求常驻的表行与本轮 forward 的 batch 行需要对应，不能混用行号。"
+  },
+  "slot": {
+    "before_line": 398,
+    "text": "普通分页寻址把物理 block 编号和块内偏移合成 slot；它不是字节地址。"
+  },
+  "schedule": {
+    "before_line": 677,
+    "text": "这里开始制定本轮调度计划；实际模型计算由 worker 执行。"
+  },
+  "output": {
+    "before_line": 232,
+    "text": "调度输出传递请求与执行计划；不是把 K/V tensor 从 scheduler 传给 worker。"
+  },
+  "free": {
+    "before_line": 776,
+    "text": "释放引用与擦除 tensor 内容是两件事；空闲页可以在后续分配时复用。"
+  },
+  "shape": {
+    "before_line": 115,
+    "text": "这是 backend 的布局接口；实际 shape 要连同分支条件和传入参数一起读。"
+  },
+  "write": {
+    "before_line": 1184,
+    "text": "slot_mapping 指定本轮 token 的写入槽位；有效槽位的含义由对应 backend 约定。"
+  },
+  "read": {
+    "before_line": 1139,
+    "text": "block_table 定位历史页，序列长度界定有效范围；读取不只依赖本轮写入的 slot。"
+  },
+  "v2": {
+    "before_line": 34,
+    "text": "管理器与 kernel 使用的 block 粒度可能不同，必须检查这一适配路径。"
+  },
+  "ordinary": {
+    "before_line": 616,
+    "text": "这里按 attention 类型决定是否声明缓存；encoder 分支返回 None。"
+  },
+  "mla": {
+    "before_line": 1386,
+    "text": "这些打包格式直接指定每 token 字节数，不能仅用 head_size 推算。"
+  },
+  "mamba": {
+    "before_line": 1096,
+    "text": "逐个状态计算元素数 × dtype 字节数，再求和；此处没有乘历史 token 数。"
+  },
+  "checkpoint": {
+    "before_line": 741,
+    "text": "只有导出 checkpoint 且 spec 为 MambaSpec 时，才继续增加相关声明。"
+  },
+  "qwen": {
+    "before_line": 149,
+    "text": "先读层类型分支，再追所选模块的缓存声明；不能给所有层套同一 KV 公式。"
+  },
+  "ds-index": {
+    "before_line": 147,
+    "text": "这是 indexer 的缓存声明，只覆盖该组件，不代表整个 DSV4 模型的缓存。"
+  },
+  "resolve": {
+    "before_line": 305,
+    "text": "architectures 用来解析实现类；展示名称本身不足以确定实际执行路径。"
+  },
+  "register": {
+    "before_line": 8,
+    "text": "注册名称建立架构名与实现类的对应；仍需结合实际 checkpoint 的配置。"
+  },
+  "kimi": {
+    "before_line": 503,
+    "text": "本段按配置选择 KDA 或 MLA 路径；具体层的选择还需核对模型配置。"
+  },
+  "state-shape": {
+    "before_line": 543,
+    "text": "状态 shape 的来源在这里；统计容量时还要核对 dtype 和并行切分。"
+  },
+  "collect": {
+    "before_line": 138,
+    "text": "收集模块声明后还可能经过 backend 定制，模块最初返回的 spec 未必是最终布局。"
+  },
+  "runner": {
+    "before_line": 1,
+    "text": "这段修改 runner 的选择入口；还要沿选中的 runner 继续追分配和绑定过程。"
+  }
+}

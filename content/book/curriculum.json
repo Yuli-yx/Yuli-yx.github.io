@@ -1,0 +1,130 @@
+[
+  {
+    "id": "01",
+    "part": "共同语言",
+    "title": "谁在管理 KV Cache？",
+    "url": "kv-cache.html",
+    "status": "已编写",
+    "scope": "逻辑与物理 block；KV tensor；block table 与 slot mapping；有效数据、请求容量和池容量。"
+  },
+  {
+    "id": "02",
+    "part": "共同语言",
+    "title": "Attention 结构决定缓存什么",
+    "url": "kv-attention.html",
+    "status": "已编写",
+    "scope": "普通 Attention 的读写；MHA/GQA/MQA；MLA；窗口、稀疏与压缩；GDN/KDA 状态；混合模型记账。"
+  },
+  {
+    "id": "03",
+    "part": "共同语言",
+    "title": "从模型配置找到真实实现",
+    "url": "kv-model-path.html",
+    "status": "已编写",
+    "scope": "Checkpoint 与运行条件；architecture 注册；逐层分支；原始与定制后的 spec；Ascend runner 与 patch。"
+  },
+  {
+    "id": "04",
+    "part": "共同管理机制",
+    "title": "Cache spec、group 与物理布局",
+    "url": null,
+    "status": "待写",
+    "scope": "逐项解释 block size、dtype、page bytes、状态 shape 与压缩比例；跟踪 padding、分组与 backing/view 的关系。"
+  },
+  {
+    "id": "05",
+    "part": "共同管理机制",
+    "title": "启动时怎样建立缓存池",
+    "url": null,
+    "status": "待写",
+    "scope": "模型声明、可用内存预算、cache config、设备分配和层绑定；与 scheduler 侧 block 元数据对应。"
+  },
+  {
+    "id": "06",
+    "part": "共同管理机制",
+    "title": "一轮请求怎样分配、写入和读取",
+    "url": null,
+    "status": "待写",
+    "scope": "Scheduler 申请 block、下发增量；runner 更新表和 metadata；模型写入与 Attention 读取；结果回写。"
+  },
+  {
+    "id": "07",
+    "part": "共同管理机制",
+    "title": "复用、回收与恢复",
+    "url": null,
+    "status": "待写",
+    "scope": "Prefix caching、引用计数、抢占重算、窗口回收与状态 checkpoint；按缓存类型说明恢复边界。"
+  },
+  {
+    "id": "08",
+    "part": "真实模型案例",
+    "title": "普通 GQA 模型：完整基线案例",
+    "url": null,
+    "status": "待写",
+    "scope": "固定一个具体 checkpoint；列出各层 spec、tensor 和 page 数；完成请求时间轴与容量总账。"
+  },
+  {
+    "id": "09",
+    "part": "真实模型案例",
+    "title": "Qwen3.5 / Qwen3.6：Full Attention + GDN",
+    "url": null,
+    "status": "待写",
+    "scope": "分别核对 checkpoint 配置；展开层类型、普通 KV、卷积与 recurrent state；解释混合分组、前缀恢复和重算。"
+  },
+  {
+    "id": "10",
+    "part": "真实模型案例",
+    "title": "Kimi K3：MLA + KDA",
+    "url": null,
+    "status": "待写",
+    "scope": "按配置区分 MLA 与 KDA 层；核对 no-RoPE latent、状态 shape、dtype 和管理单位；与 Qwen 混合模式比较。"
+  },
+  {
+    "id": "11",
+    "part": "真实模型案例",
+    "title": "DeepSeek V4：压缩与多类缓存",
+    "url": null,
+    "status": "待写",
+    "scope": "逐项列出主缓存、压缩表示、indexer 与 compressor state；解释原始位置到存储位置的转换和 page padding；不混用 V4.1。"
+  },
+  {
+    "id": "12",
+    "part": "真实模型案例",
+    "title": "GLM-5.3：稀疏 Attention 缓存链路",
+    "url": null,
+    "status": "待写",
+    "scope": "从具体 checkpoint 落实模型入口；分别追踪主缓存与 indexer；分析增长规律、读写路径和释放条件。"
+  },
+  {
+    "id": "13",
+    "part": "真实模型案例",
+    "title": "GLM-5.3-Flash：混合 Attention 与辅助状态",
+    "url": null,
+    "status": "待写",
+    "scope": "拆开主缓存、KDA、压缩 indexer 和 tail ring；按组件记录实际 spec、状态更新、分组与回收。"
+  },
+  {
+    "id": "14",
+    "part": "横向对照",
+    "title": "同一个请求，在不同模型里会发生什么？",
+    "url": null,
+    "status": "待写",
+    "scope": "固定 token 数、chunk 划分和生成步骤，逐步对比各模型的有效内容、分配行为与状态变化。"
+  },
+  {
+    "id": "15",
+    "part": "横向对照",
+    "title": "如何算准一个真实模型的缓存容量？",
+    "url": null,
+    "status": "待写",
+    "scope": "按 layer 与 cache type 汇总；区分增长项、窗口项、状态项和辅助开销；核对共享 storage，避免重复计数。"
+  },
+  {
+    "id": "16",
+    "part": "横向对照",
+    "title": "接到系统专题：并行、传输与池化",
+    "url": null,
+    "status": "待写",
+    "scope": "为各模型列出 PCP/DCP 需要分布、P/D 需要传输、KV Pool 需要保存与恢复的对象；连接全站专题。"
+  }
+]
