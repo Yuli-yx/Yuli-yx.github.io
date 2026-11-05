@@ -14,6 +14,9 @@ KV Cache 第一章位于 `/kv-cache.html`，保留左侧章节目录、源码摘
 
 ## 内容
 
+- GLM-5.3-Flash 三篇适配专题：Attention/缓存布局、共享池对象与 layerwise、PD 交接与生命周期。
+- Flash 专题包含 MTP 页内布局、key 身份、同步/异步时序与 N-1 交接交互演算。
+
 - MRV2 四个实现跟读单元、原导览和参考表。
 - KV cache 概念地图：tensor、block、group、padding、生命周期。
 - KV cache 初始化源码链：Attention spec、Engine 规划、Worker 分配、Scheduler BlockPool。
@@ -34,6 +37,10 @@ npm run preview
 `content/sources.json` 保存已核对源码节选、commit、行号和源文件 SHA256。更新源码证据时，先确认新版本接口与正文一致，再运行 `node scripts/snapshot.mjs <workspace>`；不要只替换版本号。
 
 `content/mrv2/` 是独立快照，保留原版本语境。原个人课程目录继续保留；本仓库仅包含公开阅读内容。
+
+Flash 专题使用独立的 `content/flash-sources.json`，不覆盖旧课程源码版本。
+运行 `node scripts/snapshot-flash.mjs <ascend-checkout> <upstream-store-checkout>`
+可重建 22 段带 commit、行号和 SHA256 的源码节选；脚本拒绝未提交的源码。
 
 ## 验证边界
 

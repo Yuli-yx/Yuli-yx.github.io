@@ -1,0 +1,46 @@
+<section id="problem"><h2>为什么不是只改一个 hash</h2>
+<p>底层 MemCache 可以保存字节，但它不知道这些字节属于哪个层、哪个 head、哪个状态边界。跨实例共享要同时回答：<b>找哪个对象？对象是什么格式？读回本地哪里？什么时候才可读？</b>只让两个 key 相等，不能保证 payload 兼容。</p>
+<table><thead><tr><th>维度</th><th>原 Ascend Store 路径</th><th>这次共享格式</th></tr></thead><tbody>
+<tr><td>对象身份</td><td>模型、rank/head、DCP/PP、group、role/family、chunk hash；不同 backend/layerwise 模式有各自寻址方式</td><td>复用 PoolKey 字符串，rank 字段表达逻辑 Store shard，加入版本化 schema</td></tr>
+<tr><td>布局关系</td><td>与本地分片、group 和后端描述较紧密；已有受限的 GQA TP mismatch 能力</td><td>用上游 StoreLayout 规划 shard 和范围，再绑定 Ascend 实际组件</td></tr>
+<tr><td>逐层模式</td><td>已有事件、发送线程、GVA/range 任务和最终 drain</td><td>相同共享对象，按 owner 分批写；复用原发送线程</td></tr>
+<tr><td>PD 与普通池</td><td>不能假定所有既有格式天然互通</td><td>新格式完整块共用；PD 尾块和精确状态使用独立身份</td></tr>
+<tr><td>兼容边界</td><td>原路径继续保留</td><td>显式配置启用；不把旧 rank-local 对象直接解释为新格式</td></tr>
+</tbody></table>{{source:old-key}}
+<p>这里不是断言“原池化只支持 GQA”。原代码包含多类布局与后端路径；本次解决的是这几条路径之间统一的共享对象契约。也不是重新实现某个旧 PR 的 <code>make_full_hash / make_partial_hash</code>：当前完整块直接复用 request 的前缀 block hash，再由 <code>SharedPoolLayout.key()</code> 生成 PoolKey；PD 不完整块另有内容摘要。</p></section>
+<section id="upstream"><h2>上游提供分片算法，Ascend 提供物理绑定</h2>
+<p>参考并直接调用的是上游 <a href="https://github.com/vllm-project/vllm/pull/54307">#54307</a> 的固定源码：<code>HeadMajorStoreLayout</code>、<code>MambaStoreLayout</code>、<code>prepare_values()</code> 和 schema fingerprint。</p>
+<div class="flow"><div class="node"><b>上游 StoreLayout</b>逻辑 shard、head/state 切分、对象字节顺序</div><span class="arrow">＋</span><div class="node"><b>Ascend SharedPoolLayout</b>真实 tensor、stride、padding、组件 offset</div><span class="arrow">→</span><div class="node"><b>PoolObject / PoolRange</b>key + size + owner/address/offset/size</div></div>
+<p>逻辑 Store shard 将对象编号与本地 TP rank 解耦。举例，4 个逻辑 shard、P TP2 时一个 rank 负责两个 shard，D TP4 时一个 rank 对应一个 shard。双方可以按相同 shard key 找数据。这个是原理演算；<b>本次 Flash 模型验收仍是同构 TP8，state runtime 还要求 TP 与 Store TP 相同。</b></p>{{source:upstream-shard}}
+<table><thead><tr><th>直接复用</th><th>Ascend 必须适配</th><th>没有承诺的能力</th></tr></thead><tbody><tr><td>HND head-major 规划；Mamba 分片规则；prepare_values 返回地址/长度</td><td>MLA 复制规则；压缩 indexer view；KDA 页内 offset；环形请求状态；MemCache API</td><td>任意 NHD 重排、Flash 异构 TP/CP/PP、任意量化格式自动兼容</td></tr></tbody></table>
+<p>普通 attention 的共享打包顺序按 layer / component / head / token / content 定义，K、V 是不同 component。Flash MLA 单 latent head 则通过专用 view 绑定。<b>“采用 Ascend 布局”指保留本地真实布局，并用 range 映射到存储内容；不是把本地整个 cache 重排成另一套 tensor。</b></p></section>
+<section id="keys"><h2>完整块的身份：内容 + 兼容布局</h2>
+<div class="key-formula"><span>model</span><span>cache epoch</span><span>schema</span><span>Store shard</span><span>role</span><span>prefix hash</span></div>
+<p><code>cache_prefix</code> 隔离权重/缓存版本；schema 包含 owner 顺序、组件规格、Store TP、chunk/hash 粒度等。实际 key 中 epoch 被纳入 schema，而不是必须以明文独立字段出现。地址、request ID、P/D 角色、bulk/layerwise 不进入完整块内容身份。本地 allocator group 被规范化，避免两端 group 编号不同造成假不兼容。</p>{{source:shared-key}}
+<div class="flash-lab" data-key-lab><div class="lab-heading"><b>切换执行角色，看哪些字段保持不变</b><label>写入端 <select name="role"><option>P</option><option>D</option><option>普通池化</option></select></label><label>执行模式 <select name="mode"><option>layerwise</option><option>bulk</option></select></label><label>权重 epoch <select name="epoch"><option>weights-v1</option><option>weights-v2</option></select></label></div><output aria-live="polite"></output><p class="lab-note">教学示意，不是实际 SHA256 结果或可调用的池 key。假定相同 prompt、模型与布局。</p></div>
+<p>schema 匹配意味着这两端声明的格式兼容，不等于数学精度已验证。相同模型名也不能区分不同权重；因此共享配置要求显式 epoch。</p></section>
+<section id="values"><h2>value 的构造：按范围复制，不搬 padding</h2>
+<p><code>SharedPoolLayout.objects()</code> 调用上游 <code>prepare_values()</code>，再按 owner 生成 <code>PoolRange(owner, address, offset, size)</code>，并检查逐层范围拼接顺序与整个 group 的对象顺序一致。</p>
+<div class="packed"><div><b>本地页</b><span class="chip conv">conv</span><span class="chip state">recurrent</span><span class="chip padding">padding</span></div><span class="arrow">有效范围 →</span><div><b>池对象</b><span class="chip conv">conv bytes</span><span class="chip state">recurrent bytes</span></div></div>
+<p>本地不额外构造一份 packed tensor；MemCache 目标地址使用 <code>object_gva + range.offset</code>，源地址来自实际 view。bulk 复制全部范围，layerwise 在该 owner 就绪后复制相应范围，最终 key 与 payload 相同。</p>{{source:shared-ranges}}
+<p>MLA 复制内容由 rank 0 写入，各 rank 读取；KDA 按实际本地状态页读取。压缩 indexer 的尾部只传已完成压缩行，余下信息依赖 PD 的环形状态。这些差异由 cache spec / tensor 绑定表达，不在通用 MemCache I/O 中按模型名分支。</p></section>
+<section id="lookup"><h2>命中的是共同恢复点，不是一堆独立 key</h2>
+<p>普通 <code>AscendStoreConnector</code> 与新 PD connector 共用 <code>SharedPoolTransfer</code>。lookup 对 attention 要求连续历史块，对 recurrent state 查找可用 checkpoint，最后取共同边界。</p><pre>attention 可恢复边界：{640, 1280}
+recurrent checkpoint：{640}
+共同命中：640
+
+有 1280 的 KV ≠ 可以跳过前 1280 tokens 的计算。</pre>{{source:lookup}}
+<p>普通池化只保存完整、已提交且实际生成 cache 的块，不查询 PD 尾块。D 开启 <code>save_decode_cache</code> 后跨过完整边界，保存同格式对象；之后 P 可以命中。worker 的 <code>describe_groups()</code> 通过现有 lookup RPC 将实际 target/prefix groups 告知 scheduler，避免 draft 或辅助 cache 分组变化引起误判。</p></section>
+<section id="layerwise"><h2>layerwise：复用原发送线程实现层间重叠</h2>
+<p>最初版本在 forward 回调中 <code>event.synchronize()</code> 后同步拷贝，只有逐层粒度，没有计算—传输重叠。当前提交已经改为 <code>StoreLayerTask</code> 接入原 <code>KVCacheStoreLayerSendingThread</code>；没有新建另一套线程框架。</p>
+<div class="flash-lab" data-overlap-lab><div class="lab-heading"><b>对比发送时序</b><label>执行方式 <select name="execution"><option value="async">当前：原发送线程异步执行</option><option value="sync">旧版：前台同步逐层复制</option></select></label></div><div class="timeline" data-timeline></div><output aria-live="polite"></output><p class="lab-note">假设每层计算 3 单位、传输 2 单位，仅说明依赖关系；不是测得的性能或加速比。</p></div>
+<p>前台记录独立 ready event，提交完整块与 PD 状态 session；后台等待事件后执行原有 shared I/O 的 range copy。所有 session 的发布和租约清理由前台在 drain 之后完成，避免与后台修改 completed ranges 竞争。</p>{{source:queue-submit}}{{source:queue-copy}}
+<p><code>use_layerwise=true</code> 控制 P 写入的逐层时机；PD 的 D 仍整体读取完成后恢复计算。普通前缀池读取可以按层或整体执行。这三件事不能用一个“异步”词概括。</p></section>
+<section id="publication"><h2>发布与租约：分配成功还不算命中</h2>
+<pre>写：batch_is_readable → batch_alloc → 逐层/整体 batch_copy
+    → drain → 校验所有 range 完成 → batch_write_finish → 释放租约
+
+读：batch_add_lease → batch_get_key_info（地址与长度）
+    → batch_copy → 完成读取 → 释放租约</pre>
+<p>查询使用 readable 状态，不以“已分配”代替“已写完”。<code>batch_add_lease</code> 返回状态码，不是对象地址。多个本地读取共享同一个 key 的租约引用；最后一个使用者结束后才释放。失败的未完成对象不能发布，也不贸然用删除操作补偿，以免误删其他 writer 共享的对象。</p>{{source:publish}}
+<p>仍有明确限制：普通同步 lookup 到真正加租约之间遇到淘汰，可能使执行 step 失败；长期并发 writer、后端原生 lease 故障注入尚需验证。下一篇说明 PD 请求如何使用这套通用对象机制。</p></section>

@@ -1,0 +1,40 @@
+<section id="boundary"><h2>新增 connector，职责仍落在 PD 与池化内部</h2>
+<p>对外入口是 <code>LayerwisePoolConnector</code>，位于 <code>kv_p2p/pd_pool/</code>。它组合真实的 <code>KVPoolScheduler / KVPoolWorker</code>，没有继承整套 Mooncake V2，也没有复制它的网络传输。</p>
+<table><thead><tr><th>模块</th><th>职责</th><th>不负责</th></tr></thead><tbody><tr><td>pd_pool/connector.py</td><td>vLLM 回调、Mamba 恢复扩展点、完成事件透传</td><td>对象布局与模型算法</td></tr><tr><td>pd_pool/scheduler.py</td><td>识别 CPD 请求、N−1 边界、接收和最终尾块计划</td><td>MemCache 地址与设备复制</td></tr><tr><td>pd_pool/worker.py</td><td>尾块/精确状态计划、整体接收、请求成功或失败</td><td>独立 key 格式和异步发送框架</td></tr><tr><td>ascend_store/shared_*.py</td><td>对象身份、真实布局、完整块读写、租约与发布</td><td>proxy 的 HTTP 请求语义</td></tr><tr><td>原 layerwise/kv_transfer.py</td><td>后台等待就绪事件、执行共享 range 复制</td><td>决定投机 token 是否接受</td></tr></tbody></table>
+<p>Mooncake V2 只抽取复用 <code>truncate_stateful_prefill_request()</code> 这段纯逻辑。KDA、环形页的恢复遵循既有 target/draft、状态边界与物理内容契约；它们没有被改造成另一种模型结构。</p></section>
+<section id="request"><h2>跟一个 800-token 请求走完 P → D</h2>
+<p>本例实际逻辑 block=640。Flash 的 stateful 路径沿用 CPD 的最后 token 重算：P 计算前 799 tokens，D 恢复它们，再计算最后一个 prompt token。<b>不是用户重复发送两次请求，也不是两个独立的回答。</b>proxy 内部转发 P、D 两个阶段。</p>
+<div class="flow"><div class="node"><b>P 计算与入池</b>逐层 ready → 后台 copy → step drain → 发布</div><span class="arrow">→</span><div class="node"><b>共享 MemCache</b>完整块 + PD 尾块 + 精确状态</div><span class="arrow">→</span><div class="node"><b>D 整体恢复</b>本地 block IDs → GET → finished_recving</div></div><p class="lab-note">数据经池传递；控制另走 P response → 原 proxy 透传 → D request。租约和完成事件管理资源，不通过 proxy 搬运 cache 字节。</p>
+<div class="flash-lab" data-pd-lab><div class="lab-heading"><b>改变 prompt 长度，查看交接组成</b><label>输入 tokens <input name="tokens" type="number" min="2" max="1024" value="800"></label></div><div class="boundary-bars" data-boundary></div><output aria-live="polite"></output><p class="lab-note">演算适用于此处 stateful N−1 路径。1-token 等短请求由实际分支处理，不套用本控件的分块假设。</p></div>
+<ol class="request-steps"><li><b>P / PoolPDScheduler.on_new_request()</b><p>保存原始 prompt 长度和摘要，再调用截断 helper，保留 D 重算最后 token 的契约。</p></li><li><b>P / KVPoolScheduler</b><p>普通前缀查找、完整块读写继续由池化调度。完整块不必等整个 prompt 结束；最终 PD 尾块和精确状态在最后 chunk 到达交接边界时下发。</p></li><li><b>P / PoolPDWorker.prepare() → save_layer()</b><p>生成对象与 session，每层就绪后提交原 layerwise 发送队列。799 tokens 对应 640 完整块、159 attention 尾部和 799 边界的 KDA/环形状态。</p></li><li><b>P / wait_for_save() → finish()</b><p>排空所有完整块与尾状态复制，发布对象，回传 checkpoint 完成事件。成功结果交回调度侧后，request_finished 才提供 handoff。</p></li><li><b>Proxy</b><p>沿用原 examples/disaggregated_prefill_v1/load_balance_proxy_server_example.py，透传 kv_transfer_params。</p></li><li><b>D / get_num_new_matched_tokens() → update_state_after_alloc()</b><p>检查协议、原始长度、MTP 数；申请外部恢复范围 N−1 减去本地已命中长度，拿到 D 自己的 block IDs。</p></li><li><b>D / PoolPDWorker.start_load()</b><p>根据请求与布局重建 key，整体恢复所有必需组件，成功后报告 finished_recving。随后 runner 执行最后 token 和本地 draft 初始化。</p></li></ol>
+{{source:pd-match}}{{source:pd-load}}
+</section>
+<section id="handoff"><h2>Proxy 透传什么，D 又如何找到 key</h2>
+<pre>{
+  "do_remote_prefill": true,
+  "do_remote_decode": false,
+  "pool_pd_protocol": "ascend_shared_v1",
+  "remote_num_prompt_tokens": 800,
+  "pool_pd_mtp_tokens": 1
+}</pre>
+<p>沿用原来的 envelope，不让 proxy 理解 cache 布局。不转发物理地址、P 的 block IDs、rank 列表或对象 key 列表。D 已有同一请求的 prompt，可以重算完整前缀 hash 与原始 prompt 摘要；再结合兼容 schema、Store shard 和有效长度定位对象。</p>
+<table><thead><tr><th>对象</th><th>内容摘要/判别字段</th><th>互通范围</th></tr></thead><tbody><tr><td>完整前缀块</td><td>request 的 committed prefix block hash</td><td>PD 与普通池共享</td></tr><tr><td>attention 不完整尾块</td><td>partial_有效长度_原始prompt摘要</td><td>仅 PD；普通池不查找</td></tr><tr><td>精确 KDA / 环形状态</td><td>pd_state_状态边界_原始prompt摘要</td><td>仅 PD；不同组件由 schema 隔离</td></tr></tbody></table>
+<p>prompt 摘要包含完整 token 序列和上游额外缓存身份（如 salt、LoRA、MM/embedding 身份）。这只是 hash 契约，不代表已经完成多模态模型验收。交接完成后不主动删除尾对象，交给池的正常回收机制。</p>{{source:pd-handoff}}{{source:tail-key}}
+</section>
+<section id="lifetime"><h2>生命周期要守住三道边界</h2>
+<div class="lifetime-grid"><div><b>① 计算写完</b><p>ready event 保证源数据已产生。由后台线程等待，前台可以继续后续层。</p></div><div><b>② 传输读完</b><p>drain 保证没有在途读取。之前不能覆盖 live state、释放源页或销毁 session。</p></div><div><b>③ 对象可读</b><p>全部 range 完成才能发布；完成 ACK 必须晚于数据完成。</p></div></div>
+<p><code>RequestStateLayout.snapshot()</code> 返回的只是源内存范围，<b>并没有 clone</b>。环形页会在后续执行中原地更新；KDA conv/recurrent 同样会变化。block 引用只阻止 allocator 回收，不阻止模型写同一地址。</p>{{source:state-snapshot}}
+<p>因此当前采用层间重叠、step 边界排空：本层完成 → 后台复制，同时后续层计算 → 本 step drain → 下一 chunk/step 才可覆盖。共享格式仍拒绝未经验证的跨层 HBM 复用配置，不启用旧路径可选的跨 step 延迟 drain。只有源地址独立且回调真正位于该 owner 最后一次写入之后，这个推理才成立。</p>
+<div class="flash-lab" data-life-lab><div class="lab-heading"><b>生命周期逐步推演</b><button type="button" data-next>下一步</button><button type="button" data-reset>重置</button></div><ol class="life-stages"><li>源状态计算中</li><li>记录事件 / 入队</li><li>后台复制</li><li>排空 / 发布</li><li>完成确认 / 可复用</li></ol><output aria-live="polite"></output></div>
+<p>普通 KDA checkpoint 沿用 scheduler 的引用保护：保留非空、非 speculative scratch block，worker 完成后回传 <code>completed_events</code>，达到预期 worker 数才释放。scratch 不能随意 pin，否则会破坏 allocator 的独占重定位要求。</p>{{source:pin}}{{source:drain}}
+<p>取消、关闭和异常也先处理在途复制。发送失败会在唤醒 drain 之前记录 fatal error；停止的任务不会发布半成品。租约保护远端对象，源页引用与 drain 保护本地数据，两者不能互相替代。</p>
+</section>
+<section id="mtp"><h2>MTP：共享 target，D 仍然自己算 draft</h2>
+<p><code>pool_pd_mtp_tokens</code> 只检查当前 Flash 的缓存兼容性，不是 P 给 D 分配投机任务。MTP=0/1 会改变 target conv 宽度与环形容量，因此本阶段要求 P/D 相同 MTP 数。D 不读取 P 的 draft cache，继续本地初始化。</p>
+<p>target/draft 的筛选依据实际 owner。唯一位于 PD/池化之外的产品改动，是 MRV2 在 cache spec 转换与 padding 后传播 <code>is_draft_layer → is_draft</code>。先标记再重建 spec 可能丢失标记；把传播放到转换之后，才能正确排除辅助 indexer 等 draft cache。</p>{{source:draft}}
+<p>异步化不修改 MTP 接受/拒绝或 RecoverSSM commit。保存范围仍必须对应已提交、已物化的 cache；ready event 无法替代提交判定。CPU 生命周期测试证明队列顺序和引用释放约束，不足以证明所有投机算子路径上的状态时刻均正确，仍需新的 NPU 模型回归。</p></section>
+<section id="validation"><h2>验证到哪里，以及还欠什么</h2>
+<table><thead><tr><th>版本 / 证据</th><th>覆盖</th><th>不能推导出</th></tr></thead><tbody><tr><td>同步实现的硬件阶段</td><td>Flash BF16 TP8；普通池双向共享；bulk/layerwise 四组合；PD 边界和尾块；相同 MTP=0/1；原生 KDA/环形字节恢复</td><td>新异步改动已通过模型验收；异构、量化、图模式也支持</td></tr><tr><td>同步版本最终 HTTP 检查</td><td>10 个顺序响应及恢复后 4 个响应，token 与 logprob 对齐原生参考</td><td>数据集精度与长期稳定性</td></tr><tr><td>同步版本并发观测</td><td>8 个完整输出 token 对齐；有真实抢占；部分 logprob 差异仍未确定原因</td><td>位级数值等价，或差异一定是舍入误差</td></tr><tr><td>当前异步提交 80706e732d</td><td>261 项远端 CPU 回归；包含原 layerwise、阻塞复制、finish/cancel、失败不发布、live state 保护；哈希核对同步文件</td><td>真实 NPU overlap、模型正确性、吞吐提升</td></tr></tbody></table>
+<p>硬件阶段配对运行时为 vLLM <code>5df63a7203cd</code> / Ascend <code>23e0e3764293</code> 加连接器增量和必要兼容 backport；开发基线为 <code>3141813e89fd</code>。当前文章源码快照不同于原生镜像基线，不应解释成任意发布 wheel 都能直接运行。</p>
+<p>合入前仍需：上游接口对齐、处理 main 冲突、完整 CI、异步版本 NPU 精度与性能、长期并发 writer 与淘汰/租约故障注入。普通同步查找后对象被淘汰的隔离仍有 gap；PD 缺对象可报告请求失败，但现有 hybrid 自动重算 guard 没有移除。</p>
+<p>本轮源码改动保持在 KV transfer、池化与必要 ownership metadata 范围内。网站中的交互只是依赖关系和布局演算，不替代这些验证。</p></section>

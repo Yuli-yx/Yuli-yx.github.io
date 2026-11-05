@@ -1,0 +1,177 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="vLLM 与 vLLM-Ascend 源码学习笔记：实现、软件设计、可视化与手算例子。"><meta name="color-scheme" content="light"><title>GLM-5.3-Flash · 模型与本地 Cache · Yuli-yx</title><link rel="stylesheet" href="../assets/site.css"><script src="../assets/site.js" defer></script><link rel="stylesheet" href="../assets/flash.css"><script src="../assets/flash.js" defer></script></head><body><header class="site-head"><div class="bar"><a class="brand" href="../index.html">Yuli-yx <small>推理系统 · 源码笔记</small></a><nav aria-label="主导航"><a href="../index.html">专题总览</a><a href="../roadmap.html">学习路线</a><a href="../about.html">关于</a><a href="https://github.com/Yuli-yx">GitHub ↗</a></nav></div></header><div class="layout"><aside class="toc" aria-label="文章目录"><strong>本篇目录</strong><a href="#overview">先把四种状态放到一张图里</a><a href="#attention">三条计算路径，四类持久内容</a><a href="#management">Ascend 怎么管理这些 cache</a><a href="#layout">实测布局：shape 不是完整地址契约</a><a href="#compressed">压缩尾部与投机状态：为什么不能漏</a><a href="#recover">一个可恢复点必须包含什么</a><a href="../index.html">← 专题总览</a></aside><main class="doc flash"><div class="kicker">适配实录 / GLM-5.3-FLASH × ASCEND STORE</div><h1>模型与本地 Cache</h1><p class="lead">先认清哪些内容必须恢复，再讨论怎么跨节点共享。</p><nav class="flash-chapters" aria-label="专题章节"><a aria-current="page" href="flash-model.html"><small>第 1 篇</small>模型与本地 Cache</a><a  href="flash-pool.html"><small>第 2 篇</small>池化对象与逐层传输</a><a  href="flash-pd.html"><small>第 3 篇</small>PD 交接与生命周期</a></nav><div class="flash-version"><b>可评审实现，不等于生产支持</b><p>源码：Ascend <code>80706e732d2b</code>；上游 StoreLayout <code>4d1376a4922e</code>。核对日期 2026-11-05。<a href="https://github.com/vllm-project/vllm-ascend/pull/21000">Draft PR #21000 ↗</a></p><p>范围：Flash BF16、同构 TP8/EP8、MRV2 eager、PP=PCP=DCP=1、P/D 相同 MTP 数。旧同步实现已有模型实验；新异步写入已过 261 项远端 CPU 回归，尚未完成新一轮 NPU 模型与性能验收。</p></div><section id="overview"><h2>先把四种状态放到一张图里</h2>
+<p>GLM-5.3-Flash 在这份 Ascend 实现中对应 <code>glm5next</code>。它不是“每层都保存普通 K/V”的单一 attention 模型：主干按配置选择 <b>MLA attention 或 KDA linear attention</b>；带稀疏索引的 MLA 又有独立的压缩 indexer 和未完成压缩组的环形状态。模型还有 MoE、MTP 等组件，但专家权重与路由不是本专题要传的 cache。</p>
+<div class="cache-atlas"><div class="atlas-main"><span>MLA / 稀疏 attention</span><b>历史 latent KV</b><p>按 token 分页，保存用于实际 attention 的历史内容。</p><div class="atlas-sub"><b>KeyPool indexer</b><p>压缩 key → 选 Top-K 历史位置</p><b>环形 K / gate</b><p>保留尚未完成压缩的输入与投机余量</p></div></div><div class="atlas-state"><span>KDA / 线性 attention</span><b>卷积历史 + 递归矩阵</b><p>历史被更新到状态中。恢复某个前缀，需要那个前缀边界的 checkpoint。</p></div></div>
+<p><b>Indexer 是选择历史位置的辅助路径，不是第三套独立的主干 attention。</b>此外，模型内部的 <em>KeyPool</em> 是压缩索引机制；外部 <em>KV pool / Ascend Store</em> 是跨请求、跨实例存取 cache 的存储机制。名字接近，职责完全不同。</p>
+<p>以下以固定源码解释缓存机制；层数与分布以部署权重配置为准。实际层序列由 <code>layer_types</code> 决定；MTP 层在这里走 MLA 分支，不按主干 KDA 层类型选择。</p><details class="code-source"><summary>展开源码 · vllm_ascend/models/glm5next/model.py:319–348</summary><pre><code>        is_kda_layer = not is_mtp_layer and _is_kda_layer(config, layer_idx)
+        self.layer_kind = &quot;kda&quot; if is_kda_layer else &quot;mla&quot;
+        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+
+        if is_kda_layer:
+            self.self_attn = Glm5NextLinearAttention(
+                config=config,
+                vllm_config=vllm_config,
+                prefix=f&quot;{prefix}.self_attn&quot;,
+            )
+        else:
+            # MLA layers require the latent head dims, which are guaranteed set
+            # on MLA configs; narrow away the `int | None`.
+            assert config.v_head_dim is not None
+            assert config.kv_lora_rank is not None
+            self.self_attn = Glm5NextMLAAttention(
+                vllm_config=vllm_config,
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=config.q_lora_rank,
+                kv_lora_rank=config.kv_lora_rank,
+                max_position_embeddings=config.max_position_embeddings,
+                cache_config=cache_config,
+                quant_config=quant_config,  # keep MLA projections quantized when checkpoint weights are quantized
+                prefix=f&quot;{prefix}.self_attn&quot;,
+                topk_indices_buffer=topk_indices_buffer,</code></pre><div class="source-meta">ascend @ 80706e732d2b · <a href="https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/model.py#L319-L348">固定版本源码 ↗</a></div></details>
+<div class="flow"><div class="node"><b>输入 hidden states</b>进入 decoder layer</div><span class="arrow">→</span><div class="node"><b>按 layer_types 选择</b>KDA，或 MLA（可带稀疏 indexer）</div><span class="arrow">→</span><div class="node"><b>残差与 FFN / MoE</b>专家并行处理本层输出</div><span class="arrow">→</span><div class="node"><b>后续层与输出</b>target logits → 采样 / 投机验证</div></div>
+</section>
+<section id="attention"><h2>三条计算路径，四类持久内容</h2>
+<div class="table-scroll"><table><thead><tr><th>路径</th><th>做什么</th><th>需要留到下一步的内容</th><th>共享难点</th></tr></thead><tbody>
+<tr><td>MLA</td><td>用低维 latent 表示历史 KV，再执行 attention；稀疏版本按索引选择历史位置</td><td>主 latent cache；RoPE 部分取决于模型配置，本次观测到 NoPE 主 cache 的 rope view 为空</td><td>不能套用普通每 head 各一份 K/V 的地址假设</td></tr>
+<tr><td>KeyPool indexer</td><td>将若干 token 的 key/gate 聚合成压缩 key，参与历史 Top-K 选择</td><td>已完成的压缩 key；可选量化布局还可能有 scale</td><td>逻辑 token 数不等于压缩 cache 行数；没完成的一组不能当有效行写池</td></tr>
+<tr><td>KDA</td><td>卷积处理局部历史，再更新递归状态；prefill 与 decode 可走不同算子路径</td><td>conv state 与 recurrent state</td><td>原地更新；前缀命中必须恢复同一边界状态，不能只找历史 KV</td></tr>
+<tr><td>Indexer 环形 tail</td><td>保存未完成压缩组及投机 lookahead 的 raw key/gate</td><td>请求独占的 FP32 环形页</td><td>不是完整前缀块；同一页会反复覆盖，PD 任意交接边界需要精确快照</td></tr>
+</tbody></table></div>
+<p>可以这样理解 KDA：attention 的历史信息压进了一个不断更新的状态，而不是保留所有 token 的完整 K/V。为了支持前缀恢复，运行时仍可能保存多个可复用 checkpoint；“状态大小固定”不意味着整个服务只分配一个 state。</p>
+</section>
+<section id="management"><h2>Ascend 怎么管理这些 cache</h2>
+<div class="flow"><div class="node"><b>模型声明 spec</b>主 attention、indexer、tail 和 KDA 各自声明缓存需求</div><span class="arrow">→</span><div class="node"><b>Engine 规划 group</b>确定块粒度、page 成本、分组与 block 数</div><span class="arrow">→</span><div class="node"><b>Worker 建立 view</b>原始 backing → shape / stride / component offset</div><span class="arrow">→</span><div class="node"><b>Scheduler 分配使用权</b>请求 block table 与 checkpoint 引用</div></div>
+<p>Indexer 与 tail 通过 <code>AttentionLayerBase</code> 注册到静态上下文，但它们设置了 <code>align_kv_cache_with_mamba=False</code>，有模型专用的小页布局。KDA 则用 Mamba/SSM 的状态管理和对齐 checkpoint 契约。<b>同组共享的是 block 管理规则，不代表不同层共享同一份内容。</b></p>
+<p>必须分清三种粒度：scheduler 的逻辑 block、算子读取的 kernel page、prefix hash 的粒度。本次模型实验实际逻辑块为 <b>640 tokens</b>；MLA kernel page 为 128 tokens，因此一逻辑块覆盖 5 个 kernel pages。CLI 输入 128 不能直接当作最终逻辑块大小。</p>
+<p>继续阅读背景：<a href="kv-basics.html">tensor / block / group 概念地图</a>、<a href="kv-initialization.html">从 spec 到设备 tensor</a>。</p>
+</section>
+<section id="layout"><h2>实测布局：shape 不是完整地址契约</h2>
+<p>下表来自前一版同步实现的 Flash BF16、TP8 模型布局记录。<code>Bₖ</code> 表示 kernel page 数，<code>Bₛ</code> 表示状态页数，不可混用。数值是观测样例，适配器从实际 spec/tensor 推导，不按这些数字硬编码。</p>
+<div class="table-scroll"><table><thead><tr><th>组件</th><th>MTP=0 的观测 view</th><th>MTP=1 的变化</th><th>存储语义</th></tr></thead><tbody>
+<tr><td>主 MLA latent</td><td>BF16 (Bₖ, 128, 1, 512)</td><td>主干示例不变；排除额外 draft owners</td><td>TP 复制内容，rank 0 写、各 rank 读</td></tr>
+<tr><td>压缩 indexer</td><td>BF16 (Bₖ, 32, 1, 128)，压缩比 4</td><td>已完成组仍按同一压缩比例</td><td>每逻辑块 160 个压缩行；不是 640 行</td></tr>
+<tr><td>KDA conv</td><td>BF16 (Bₛ, 3, 3072)</td><td>(Bₛ, 4, 3072)</td><td>历史窗口因 lookahead 增长</td></tr>
+<tr><td>KDA recurrent</td><td>FP32 (Bₛ, 8, 128, 128)</td><td>该样例组件形状不变，但页内起点变化</td><td>TP 本地状态；按 checkpoint 恢复</td></tr>
+<tr><td>环形 tail</td><td>FP32 (Bₛ, 4, 256)</td><td>(Bₛ, 5, 256)</td><td>最后一维为 K/gate 两部分；请求生命周期</td></tr>
+</tbody></table></div>
+<div class="flash-lab" data-layout-lab><div class="lab-heading"><b>页内有效数据与 padding</b><label>MTP tokens <select name="mtp"><option value="0">0</option><option value="1">1</option></select></label></div><p>选择配置，观察 conv 增长如何改变 recurrent 的字节偏移。这里只演算上述实测页，不模拟执行。</p><div class="byte-lane" data-state-lane></div><div class="byte-lane" data-ring-lane></div><output aria-live="polite"></output></div>
+<p>KDA 实测页跨度 655,360 B。MTP=0 时 conv 占 18,432 B，recurrent 占 524,288 B；MTP=1 时 conv 占 24,576 B。环形页跨度 40,960 B，但有效内容仅 4,096 / 5,120 B。<b>把 page stride 当作有效 payload 长度，会把 padding 一起传走；把 shape 当作连续地址，也可能读错下一个 block。</b></p><details class="code-source"><summary>展开源码 · vllm_ascend/models/glm5next/cache_views.py:27–53</summary><pre><code>def view_kpool_tail_cache(
+    layer_name: str,
+    kv_cache_spec: AscendIndexerKPoolTailSpec,
+    raw_cache: torch.Tensor | tuple[torch.Tensor, ...],
+    num_blocks: int,
+) -&gt; list[torch.Tensor]:
+    if not isinstance(raw_cache, torch.Tensor):
+        raise ValueError(f&quot;KPool tail cache for {layer_name} must use one raw tensor.&quot;)
+    typed_slot = raw_cache.view(kv_cache_spec.dtype)
+    dtype_size = get_dtype_size(kv_cache_spec.dtype)
+    page_el = typed_slot.numel() // num_blocks if num_blocks else 0
+    tail_block_el = kv_cache_spec.unpadded_page_size_bytes // dtype_size
+    if num_blocks and tail_block_el &gt; page_el:
+        raise ValueError(
+            f&quot;KPool tail cache for {layer_name} does not fit one small page: &quot;
+            f&quot;tail={tail_block_el} elements, page={page_el} elements.&quot;
+        )
+    return [
+        torch.as_strided(
+            typed_slot,
+            size=(num_blocks, kv_cache_spec.block_size, 2 * kv_cache_spec.head_size),
+            stride=(page_el, 2 * kv_cache_spec.head_size, 1),
+        )
+    ]
+
+
+def view_compressed_indexer_cache(</code></pre><div class="source-meta">ascend @ 80706e732d2b · <a href="https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/cache_views.py#L27-L53">固定版本源码 ↗</a></div></details><details class="code-source"><summary>展开源码 · vllm_ascend/models/glm5next/kda.py:219–239</summary><pre><code>    def get_state_shape(
+        self,
+    ) -&gt; tuple[tuple[int, ...], tuple[int, ...]]:
+        # conv_state width must include num_spec so the spec-decode conv update
+        # (AscendC causal-conv with num_accepted_tokens) can
+        # slide the window across the draft-verify tokens without reading past
+        # the allocated width. Matches qwen_gdn_linear_attn.get_state_shape.
+        shapes = MambaStateShapeCalculator.kda_state_shape(
+            self.tp_size,
+            self.num_heads,
+            self.head_dim,
+            conv_kernel_size=self.conv_size,
+            num_spec=self.num_spec,
+        )
+        if self.use_recoverssm:
+            return MambaStateShapeCalculator.append_kda_recoverssm_record(
+                shapes, self.num_heads, self.head_dim, self.tp_size, self.num_spec + 1
+            )
+        return shapes
+
+    def __init__(</code></pre><div class="source-meta">ascend @ 80706e732d2b · <a href="https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kda.py#L219-L239">固定版本源码 ↗</a></div></details>
+</section>
+<section id="compressed"><h2>压缩尾部与投机状态：为什么不能漏</h2>
+<p>压缩比为 4 时，只有位置满足 <code>(position + 1) % 4 == 0</code> 才产生一个完成的压缩组。比如已计算 799 tokens，已完成 199 组，还剩 3 tokens 的尾部历史。恢复时只搬 199 行压缩 key 不够，下一 token 完成新组时还需要这些历史 raw key/gate。</p><details class="code-source"><summary>展开源码 · vllm_ascend/models/glm5next/kv_cache.py:45–67</summary><pre><code>def format_indexer_kpool_slot_mapping(
+    slot_mapping: torch.Tensor,
+    positions: torch.Tensor,
+    logical_block_size: int,
+    compress_ratio: int,
+) -&gt; torch.Tensor:
+    &quot;&quot;&quot;Map completed token pools onto the compressed indexer cache.&quot;&quot;&quot;
+    if compress_ratio &lt;= 1 or logical_block_size &lt;= 0 or logical_block_size % compress_ratio:
+        raise ValueError(
+            f&quot;logical_block_size={logical_block_size} must be divisible by compress_ratio={compress_ratio}.&quot;
+        )
+    valid = (slot_mapping &gt;= 0) &amp; (torch.remainder(positions + 1, compress_ratio) == 0)
+    safe_slots = slot_mapping.clamp_min(0)
+    block_ids = torch.div(safe_slots, logical_block_size, rounding_mode=&quot;floor&quot;)
+    offsets = torch.remainder(safe_slots, logical_block_size)
+    compressed_slots = block_ids * (logical_block_size // compress_ratio) + torch.div(
+        offsets,
+        compress_ratio,
+        rounding_mode=&quot;floor&quot;,
+    )
+    return torch.where(valid, compressed_slots, torch.full_like(compressed_slots, -1))
+
+</code></pre><div class="source-meta">ascend @ 80706e732d2b · <a href="https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kv_cache.py#L45-L67">固定版本源码 ↗</a></div></details>
+<p>环形容量采用 <code>compress_ratio + num_speculative_tokens</code>。MTP 验证会先写入候选 token 的中间数据，再进行接受/拒绝判定；额外容量避免未接受的候选覆盖后续重放仍需要的历史。<b>环形缓冲里有内容，不代表这些 token 都已提交。</b></p><details class="code-source"><summary>展开源码 · vllm_ascend/models/glm5next/kv_cache.py:28–44</summary><pre><code>def get_kpool_tail_ring_capacity(vllm_config: VllmConfig, compress_ratio: int) -&gt; int:
+    &quot;&quot;&quot;Keep the open pool plus every not-yet-accepted speculative token.
+
+    Target verification writes all draft rows before rejection sampling is
+    known.  The first row is the already-sampled token and is committed; the
+    remaining ``num_speculative_tokens`` rows are lookahead.  Retaining that
+    lookahead in addition to one full pool prevents rejected rows from wrapping
+    around and destroying committed history that a replayed boundary token
+    still needs.
+    &quot;&quot;&quot;
+    speculative_config = getattr(vllm_config, &quot;speculative_config&quot;, None)
+    lookahead = int(getattr(speculative_config, &quot;num_speculative_tokens&quot;, 0) or 0)
+    if lookahead &lt; 0:
+        raise ValueError(f&quot;num_speculative_tokens must be nonnegative, got {lookahead}.&quot;)
+    return compress_ratio + lookahead
+
+</code></pre><div class="source-meta">ascend @ 80706e732d2b · <a href="https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kv_cache.py#L28-L44">固定版本源码 ↗</a></div></details>
+<p>KDA 同样有提交时刻问题。RecoverSSM 分支在验证阶段记录更新，MRV2 在拒绝采样后提交。因此层计算结束事件只表示对应算子已完成，不能被解释为“所有投机状态均已接受”。外部池化必须使用既有 committed checkpoint 选择和保存范围，而不是重新定义投机算法。</p><details class="code-source"><summary>展开源码 · vllm_ascend/models/glm5next/kda.py:633–651</summary><pre><code>            if self.use_recoverssm:
+                correction_cache, kg_cache = records
+                # One paged checkpoint per request; verification only records
+                # compact updates. MRV2 commits after rejection sampling.
+                spec_output = kda_recoverssm_verify(
+                    rearrange(q_spec),
+                    rearrange(k_spec),
+                    rearrange(v_spec),
+                    g1_spec,
+                    beta_spec,
+                    self.A_log.reshape(-1),
+                    self.dt_bias,
+                    lower_bound,
+                    recurrent_state,
+                    correction_cache,
+                    kg_cache,
+                    spec_query_start_loc,
+                    spec_state_indices_tensor[:, 0],
+                    self.num_spec + 1,</code></pre><div class="source-meta">ascend @ 80706e732d2b · <a href="https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kda.py#L633-L651">固定版本源码 ↗</a></div></details>
+</section>
+<section id="recover"><h2>一个可恢复点必须包含什么</h2>
+<div class="table-scroll"><table><thead><tr><th>恢复方式</th><th>需要的内容</th><th>边界</th></tr></thead><tbody>
+<tr><td>普通前缀池命中</td><td>完整 attention 块 + 同一边界可用的 recurrent checkpoint</td><td>所有组件共同可恢复的完整边界；环形状态交给对齐前缀重放</td></tr>
+<tr><td>PD 任意 prompt 交接</td><td>完整块 + 有效 attention 尾块 + 精确 recurrent 状态 + 环形 tail</td><td>原始 prompt 与 P 实际计算边界必须一致</td></tr>
+<tr><td>MTP</td><td>目标模型的有效恢复状态；draft 在 D 本地初始化</td><td>本阶段 P/D MTP 数必须相同；不能因排除了 draft 就忽略 target 布局变化</td></tr>
+</tbody></table></div><p>下一篇从这个“可恢复点”出发，解释为什么共池既需要改对象身份，也需要明确 value 的字节契约。</p></section>
+<nav class="flash-chapters" aria-label="专题章节"><a aria-current="page" href="flash-model.html"><small>第 1 篇</small>模型与本地 Cache</a><a  href="flash-pool.html"><small>第 2 篇</small>池化对象与逐层传输</a><a  href="flash-pd.html"><small>第 3 篇</small>PD 交接与生命周期</a></nav></main></div><footer class="site-footer">Yuli-yx · 以源码解释机制，以实验验证结论。<br><a href="../about.html#sources">版本与引用说明</a> · <a href="https://github.com/Yuli-yx/Yuli-yx.github.io">网站源码</a></footer></body></html>

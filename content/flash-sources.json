@@ -1,0 +1,229 @@
+{
+  "checked": "2026-11-05",
+  "commits": {
+    "ascend": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+    "upstream": "4d1376a4922e28d814d79fae3b16d8de9d2d46cf"
+  },
+  "entries": {
+    "layer-choice": {
+      "repo": "ascend",
+      "file": "vllm_ascend/models/glm5next/model.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 319,
+      "end": 348,
+      "sha256": "b97fc12fe393cd7aa287bad005b92c482b52a62c40d91f683253dff6f3450a24",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/model.py#L319-L348",
+      "code": "        is_kda_layer = not is_mtp_layer and _is_kda_layer(config, layer_idx)\n        self.layer_kind = \"kda\" if is_kda_layer else \"mla\"\n        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe\n\n        if is_kda_layer:\n            self.self_attn = Glm5NextLinearAttention(\n                config=config,\n                vllm_config=vllm_config,\n                prefix=f\"{prefix}.self_attn\",\n            )\n        else:\n            # MLA layers require the latent head dims, which are guaranteed set\n            # on MLA configs; narrow away the `int | None`.\n            assert config.v_head_dim is not None\n            assert config.kv_lora_rank is not None\n            self.self_attn = Glm5NextMLAAttention(\n                vllm_config=vllm_config,\n                config=config,\n                hidden_size=self.hidden_size,\n                num_heads=config.num_attention_heads,\n                qk_nope_head_dim=config.qk_nope_head_dim,\n                qk_rope_head_dim=config.qk_rope_head_dim,\n                v_head_dim=config.v_head_dim,\n                q_lora_rank=config.q_lora_rank,\n                kv_lora_rank=config.kv_lora_rank,\n                max_position_embeddings=config.max_position_embeddings,\n                cache_config=cache_config,\n                quant_config=quant_config,  # keep MLA projections quantized when checkpoint weights are quantized\n                prefix=f\"{prefix}.self_attn\",\n                topk_indices_buffer=topk_indices_buffer,"
+    },
+    "ring-capacity": {
+      "repo": "ascend",
+      "file": "vllm_ascend/models/glm5next/kv_cache.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 28,
+      "end": 44,
+      "sha256": "8e9a23a91b9d3d727c0ec1a3f71f0c9d0365e3ee952a484f85eb9df8723ed4b6",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kv_cache.py#L28-L44",
+      "code": "def get_kpool_tail_ring_capacity(vllm_config: VllmConfig, compress_ratio: int) -> int:\n    \"\"\"Keep the open pool plus every not-yet-accepted speculative token.\n\n    Target verification writes all draft rows before rejection sampling is\n    known.  The first row is the already-sampled token and is committed; the\n    remaining ``num_speculative_tokens`` rows are lookahead.  Retaining that\n    lookahead in addition to one full pool prevents rejected rows from wrapping\n    around and destroying committed history that a replayed boundary token\n    still needs.\n    \"\"\"\n    speculative_config = getattr(vllm_config, \"speculative_config\", None)\n    lookahead = int(getattr(speculative_config, \"num_speculative_tokens\", 0) or 0)\n    if lookahead < 0:\n        raise ValueError(f\"num_speculative_tokens must be nonnegative, got {lookahead}.\")\n    return compress_ratio + lookahead\n\n"
+    },
+    "compressed-slot": {
+      "repo": "ascend",
+      "file": "vllm_ascend/models/glm5next/kv_cache.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 45,
+      "end": 67,
+      "sha256": "8e9a23a91b9d3d727c0ec1a3f71f0c9d0365e3ee952a484f85eb9df8723ed4b6",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kv_cache.py#L45-L67",
+      "code": "def format_indexer_kpool_slot_mapping(\n    slot_mapping: torch.Tensor,\n    positions: torch.Tensor,\n    logical_block_size: int,\n    compress_ratio: int,\n) -> torch.Tensor:\n    \"\"\"Map completed token pools onto the compressed indexer cache.\"\"\"\n    if compress_ratio <= 1 or logical_block_size <= 0 or logical_block_size % compress_ratio:\n        raise ValueError(\n            f\"logical_block_size={logical_block_size} must be divisible by compress_ratio={compress_ratio}.\"\n        )\n    valid = (slot_mapping >= 0) & (torch.remainder(positions + 1, compress_ratio) == 0)\n    safe_slots = slot_mapping.clamp_min(0)\n    block_ids = torch.div(safe_slots, logical_block_size, rounding_mode=\"floor\")\n    offsets = torch.remainder(safe_slots, logical_block_size)\n    compressed_slots = block_ids * (logical_block_size // compress_ratio) + torch.div(\n        offsets,\n        compress_ratio,\n        rounding_mode=\"floor\",\n    )\n    return torch.where(valid, compressed_slots, torch.full_like(compressed_slots, -1))\n\n"
+    },
+    "ring-view": {
+      "repo": "ascend",
+      "file": "vllm_ascend/models/glm5next/cache_views.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 27,
+      "end": 53,
+      "sha256": "484bcb86c749e0612c797be38d83bf7ce79425d7fccada91c2324460bb5e902a",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/cache_views.py#L27-L53",
+      "code": "def view_kpool_tail_cache(\n    layer_name: str,\n    kv_cache_spec: AscendIndexerKPoolTailSpec,\n    raw_cache: torch.Tensor | tuple[torch.Tensor, ...],\n    num_blocks: int,\n) -> list[torch.Tensor]:\n    if not isinstance(raw_cache, torch.Tensor):\n        raise ValueError(f\"KPool tail cache for {layer_name} must use one raw tensor.\")\n    typed_slot = raw_cache.view(kv_cache_spec.dtype)\n    dtype_size = get_dtype_size(kv_cache_spec.dtype)\n    page_el = typed_slot.numel() // num_blocks if num_blocks else 0\n    tail_block_el = kv_cache_spec.unpadded_page_size_bytes // dtype_size\n    if num_blocks and tail_block_el > page_el:\n        raise ValueError(\n            f\"KPool tail cache for {layer_name} does not fit one small page: \"\n            f\"tail={tail_block_el} elements, page={page_el} elements.\"\n        )\n    return [\n        torch.as_strided(\n            typed_slot,\n            size=(num_blocks, kv_cache_spec.block_size, 2 * kv_cache_spec.head_size),\n            stride=(page_el, 2 * kv_cache_spec.head_size, 1),\n        )\n    ]\n\n\ndef view_compressed_indexer_cache("
+    },
+    "kda-shape": {
+      "repo": "ascend",
+      "file": "vllm_ascend/models/glm5next/kda.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 219,
+      "end": 239,
+      "sha256": "5c3a964ae09eec3ff03f58ad0573fbb199bc650f5215bf2864deddcec488c916",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kda.py#L219-L239",
+      "code": "    def get_state_shape(\n        self,\n    ) -> tuple[tuple[int, ...], tuple[int, ...]]:\n        # conv_state width must include num_spec so the spec-decode conv update\n        # (AscendC causal-conv with num_accepted_tokens) can\n        # slide the window across the draft-verify tokens without reading past\n        # the allocated width. Matches qwen_gdn_linear_attn.get_state_shape.\n        shapes = MambaStateShapeCalculator.kda_state_shape(\n            self.tp_size,\n            self.num_heads,\n            self.head_dim,\n            conv_kernel_size=self.conv_size,\n            num_spec=self.num_spec,\n        )\n        if self.use_recoverssm:\n            return MambaStateShapeCalculator.append_kda_recoverssm_record(\n                shapes, self.num_heads, self.head_dim, self.tp_size, self.num_spec + 1\n            )\n        return shapes\n\n    def __init__("
+    },
+    "kda-commit": {
+      "repo": "ascend",
+      "file": "vllm_ascend/models/glm5next/kda.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 633,
+      "end": 651,
+      "sha256": "5c3a964ae09eec3ff03f58ad0573fbb199bc650f5215bf2864deddcec488c916",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/models/glm5next/kda.py#L633-L651",
+      "code": "            if self.use_recoverssm:\n                correction_cache, kg_cache = records\n                # One paged checkpoint per request; verification only records\n                # compact updates. MRV2 commits after rejection sampling.\n                spec_output = kda_recoverssm_verify(\n                    rearrange(q_spec),\n                    rearrange(k_spec),\n                    rearrange(v_spec),\n                    g1_spec,\n                    beta_spec,\n                    self.A_log.reshape(-1),\n                    self.dt_bias,\n                    lower_bound,\n                    recurrent_state,\n                    correction_cache,\n                    kg_cache,\n                    spec_query_start_loc,\n                    spec_state_indices_tensor[:, 0],\n                    self.num_spec + 1,"
+    },
+    "old-key": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 157,
+      "end": 169,
+      "sha256": "4a9d4e1c7187f3c3ffdc97e99b31bb3991a447539dbdac1edc5e8036ce5b7a96",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/metadata.py#L157-L169",
+      "code": "    def to_string(self):\n        return (\n            f\"{self.key_metadata.model_name}\"\n            f\"@dcp:{self.key_metadata.dcp_rank}\"\n            f\"@head_or_tp_rank:{self.key_metadata.head_or_tp_rank}\"\n            f\"@pp_rank:{self.key_metadata.pp_rank}\"\n            f\"@group:{self.key_metadata.kv_cache_group_id}\"\n            f\"@cache_role:{self.key_metadata.cache_role}\"\n            f\"@cache_family:{self.key_metadata.cache_family}\"\n            f\"@{self.chunk_hash}\"\n        )\n\n    def split_layers(self, num_layers: int, layer_offset: int = 0) -> list[LayerPoolKey]:"
+    },
+    "upstream-shard": {
+      "repo": "upstream",
+      "file": "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/layout.py",
+      "commit": "4d1376a4922e28d814d79fae3b16d8de9d2d46cf",
+      "start": 305,
+      "end": 339,
+      "sha256": "06892bc0b2a5ec16cee519ce903ab1d272034800dfebed78b74d2c97b9b8fc88",
+      "url": "https://github.com/vllm-project/vllm/blob/4d1376a4922e28d814d79fae3b16d8de9d2d46cf/vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/layout.py#L305-L339",
+      "code": "class TPShardedStoreLayout(StoreLayout):\n    \"\"\"Store layout shared by divisible TP sizes.\"\"\"\n\n    def __init__(\n        self,\n        metadata: KeyMetadata,\n        block_size: int,\n        hash_block_size: int,\n        local_tp_size: int,\n        store_tp_size: int,\n        tp_rank: int,\n        store_chunk_size: int | None = None,\n    ) -> None:\n        super().__init__(metadata, block_size, hash_block_size)\n        self.store_chunk_size = store_chunk_size or block_size\n        if block_size % self.store_chunk_size:\n            raise ValueError(\"Store chunk size must divide the local block size\")\n        self.shards_per_rank = store_tp_size // local_tp_size\n        first_shard = tp_rank * self.shards_per_rank\n        self.store_shard_ids = tuple(\n            range(first_shard, first_shard + self.shards_per_rank)\n        )\n        self.store_tp_size = store_tp_size\n        self._shard_key_prefixes = {\n            shard_id: PoolKey.build_prefix(metadata, tp_rank=shard_id)\n            for shard_id in self.store_shard_ids\n        }\n        self._chunk_addr_bases: np.ndarray | list[np.ndarray] = []\n        self._chunk_block_strides: np.ndarray | list[np.ndarray] = []\n        self._chunk_sizes: np.ndarray | list[np.ndarray] = []\n\n    @property\n    def local_shard_ids(self) -> tuple[StoreShardId, ...]:\n        return self.store_shard_ids\n"
+    },
+    "shared-key": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 347,
+      "end": 359,
+      "sha256": "d49aa64a4045bdd991b1a674a46a61d105361eed4ea1381b45bc80a5a253a268",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py#L347-L359",
+      "code": "    def key(self, shard: int, digest: str) -> str:\n        if not 0 <= shard < self.store_tp:\n            raise ValueError(\"Invalid Store shard\")\n        return PoolKey(\n            replace(\n                self.metadata,\n                head_or_tp_rank=shard,\n                cache_family=self.family,\n                cache_role=\"state\" if self.state else \"kv\",\n            ),\n            digest,\n        ).to_string()\n"
+    },
+    "shared-ranges": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 387,
+      "end": 410,
+      "sha256": "d49aa64a4045bdd991b1a674a46a61d105361eed4ea1381b45bc80a5a253a268",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py#L387-L410",
+      "code": "    def objects(self, start: int, block_id: int, digest: str) -> tuple[PoolObject, ...]:\n        if not 0 <= block_id < self.num_blocks or start < 0 or start % self.chunk_size:\n            raise ValueError(\"Invalid local block or Store chunk boundary\")\n        offset = start % self.block_size\n        chunks = [(offset, offset + self.chunk_size)] * len(self.local_shards)\n        addresses, sizes, _ = self.layout.prepare_values(chunks, [block_id], self.local_shards)\n        owners = [\n            (name, layout.prepare_values(chunks, [block_id], self.local_shards))\n            for name, layout in self.layer_layouts.items()\n        ]\n        result = []\n        for index, shard in enumerate(self.local_shards):\n            ranges, actual = [], []\n            cursor = 0\n            for name, (layer_addrs, layer_sizes, _) in owners:\n                for address, size in zip(layer_addrs[index], layer_sizes[index], strict=True):\n                    ranges.append(PoolRange(name, int(address), cursor, int(size)))\n                    actual.append((address, size))\n                    cursor += int(size)\n            if actual != list(zip(addresses[index], sizes[index], strict=True)):\n                raise ValueError(\"Layer ranges disagree with the group's object byte order\")\n            result.append(PoolObject(self.key(shard, digest), cursor, block_id, tuple(ranges)))\n        return tuple(result)\n"
+    },
+    "tail-key": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 411,
+      "end": 444,
+      "sha256": "d49aa64a4045bdd991b1a674a46a61d105361eed4ea1381b45bc80a5a253a268",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py#L411-L444",
+      "code": "    def partial_objects(self, start: int, block_id: int, digest: str, valid_tokens: int) -> tuple[PoolObject, ...]:\n        \"\"\"PD-only compact tail, preserving the full object's component order.\n\n        Upstream fixed-chunk templates include invalid tail bytes. Slice each\n        validated head/token view instead; shard ownership stays upstream's.\n        No ordinary-prefix lookup ever requests this key namespace.\n        \"\"\"\n        if self.state or not 0 < valid_tokens < self.chunk_size:\n            raise ValueError(\"Partial objects require an incomplete attention chunk\")\n        if not 0 <= block_id < self.num_blocks or start < 0 or start % self.chunk_size:\n            raise ValueError(\"Invalid partial object boundary\")\n        result = []\n        for shard_index, shard in enumerate(self.local_shards):\n            ranges, cursor = [], 0\n            for owner, parts in self.component_views.items():\n                for component, view in parts:\n                    heads = view.shape[2] // len(self.local_shards)\n                    for head in range(shard_index * heads, (shard_index + 1) * heads):\n                        # Only complete compressed rows are persistent here.\n                        # Residual tokens are restored from the PD tail state.\n                        ratio = component.tokens_per_state\n                        token = int((start % self.block_size) // ratio)\n                        stop = int((start % self.block_size + valid_tokens) // ratio)\n                        while token < stop:\n                            kernel, offset = divmod(token, view.shape[3])\n                            count = min(stop - token, view.shape[3] - offset)\n                            address = view[block_id, kernel, head, offset].data_ptr()\n                            size = count * view.shape[4] * view.element_size()\n                            ranges.append(PoolRange(owner, address, cursor, size))\n                            cursor += size\n                            token += count\n            key = self.key(shard, f\"partial_{valid_tokens}_{digest}\")\n            result.append(PoolObject(key, cursor, block_id, tuple(ranges)))\n        return tuple(result)"
+    },
+    "lookup": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_transfer.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 384,
+      "end": 407,
+      "sha256": "52ce379948a8a9b32d311fb84acbd1430a44d0a66e890816c4a9d92c4de1b093",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_transfer.py#L384-L407",
+      "code": "    def lookup(self, token_len, hashes):\n        if not self.layouts:\n            return 0\n        common = None\n        for layout in self.layouts.values():\n            hits = set()\n            for start in range(0, token_len - layout.chunk_size + 1, layout.chunk_size):\n                end = start + layout.chunk_size\n                hash_index = end // layout.hash_block_size - 1\n                if hash_index >= len(hashes):\n                    break\n                digest = block_hash_to_str(hashes[hash_index])\n                keys = [layout.key(shard, digest) for shard in range(layout.store_tp)]\n                if not all(self.io.batch_is_exist(keys)):\n                    if layout.state:\n                        # State checkpoints can be sparse; unlike attention,\n                        # they do not require every historical block to exist.\n                        continue\n                    break\n                hits.add(end)\n            common = hits if common is None else common.intersection(hits)\n        alignment = self.worker.cache_transfer_granularity\n        # Rounding a checkpoint down would claim a state we never restored.\n        return max((end for end in common or () if end % alignment == 0), default=0)"
+    },
+    "queue-submit": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_transfer.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 327,
+      "end": 358,
+      "sha256": "52ce379948a8a9b32d311fb84acbd1430a44d0a66e890816c4a9d92c4de1b093",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_transfer.py#L327-L358",
+      "code": "    def save_layer(self, owner, extra_sessions=()):\n        owner = self.resolve_save_owner(owner)\n        sessions = tuple(session for _, session in self.saves) + tuple(extra_sessions)\n        if not sessions:\n            return owner\n        if self._sender is None:\n            worker = self.worker\n            self._sender = KVCacheStoreLayerSendingThread(\n                worker.m_store,\n                worker.token_database,\n                worker.block_size,\n                worker.tp_rank,\n                worker.tp_size,\n                worker.dcp_size,\n                0,\n                threading.Event(),\n                0,\n                [],\n                [],\n                group_builders=[],\n            )\n            self._sender.start()\n        self._sender.raise_if_failed()\n        event = torch.npu.Event()\n        event.record()\n        self._sender.add_request(\n            StoreLayerTask(event, self.io, sessions, frozenset(self.layer_bundles.get(owner, (owner,))))\n        )\n        self._sender.raise_if_failed()\n        return owner\n\n    def drain_saves(self):"
+    },
+    "queue-copy": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/kv_transfer.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 994,
+      "end": 1007,
+      "sha256": "9576a18a07fd705d20903bd769d4971554e4edaa339afdadaa9645443dccf721",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/layerwise/kv_transfer.py#L994-L1007",
+      "code": "        if isinstance(request, StoreLayerTask):\n            try:\n                request.ready.synchronize()\n                for session in request.sessions:\n                    request.io.copy(session, request.owners)\n            except Exception as error:\n                # Publish failure before task_done wakes a draining caller.\n                self._fatal_error = error\n                raise\n            finally:\n                self.request_queue.task_done()\n            return\n        if isinstance(request, _LayerRevokeTask):\n            try:"
+    },
+    "drain": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 152,
+      "end": 173,
+      "sha256": "14c0dee7d182bb045d92658667dc613d43bee03d169482b1d00c4c375d239ec9",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/kv_transfer.py#L152-L173",
+      "code": "    def drain(self) -> None:\n        \"\"\"Wait for copies before callers publish or release source buffers.\n\n        A failed worker may leave unstarted tasks queued. Join it first so no\n        native copy can still read the source, then discard those tasks. The\n        caller retains ownership of task resources and receives the failure.\n        \"\"\"\n        pending = self.request_queue\n        with pending.all_tasks_done:\n            while pending.unfinished_tasks and self._fatal_error is None:\n                if not self.is_alive():\n                    raise RuntimeError(f\"{self.name} stopped with pending transfers\")\n                pending.all_tasks_done.wait(timeout=0.1)\n        if self._fatal_error is not None:\n            self.join()\n            while True:\n                try:\n                    pending.get_nowait()\n                except queue.Empty:\n                    break\n                pending.task_done()\n        self.raise_if_failed()"
+    },
+    "publish": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_io.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 132,
+      "end": 153,
+      "sha256": "118a78f4811ebee5c71c51d57571531c4eb0d3fb130559c8dddcffa996593b8c",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_io.py#L132-L153",
+      "code": "    def finish(self, session: StoreIOSession) -> None:\n        if session.closed:\n            return\n        try:\n            expected = sum(len(plan.ranges) for plan in session.plans)\n            if len(session.completed) != expected:\n                raise RuntimeError(\"Cannot finish a partially copied Store object\")\n            if time.monotonic() >= session.deadline:\n                raise RuntimeError(\"Store lease expired before publication\")\n            keys = [plan.key for plan in session.plans]\n            if session.writing and keys:\n                results = self.backend.batch_write_finish(keys, [0] * len(keys))\n                if len(results) != len(keys) or any(result != 0 for result in results):\n                    raise RuntimeError(\"MemCache publication failed\")\n        except Exception as error:\n            try:\n                self.abort(session)\n            except Exception as cleanup:\n                error.add_note(f\"Lease cleanup also failed: {cleanup}\")\n            raise\n        self.abort(session)\n"
+    },
+    "pd-match": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_p2p/pd_pool/scheduler.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 38,
+      "end": 58,
+      "sha256": "3e021d08bd36b29d40730cd5351f452e356f86de0f46953f67c3c50f19a2afe4",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_p2p/pd_pool/scheduler.py#L38-L58",
+      "code": "    def get_num_new_matched_tokens(self, request, num_computed_tokens):\n        self.requests[request.request_id] = request\n        self.pd_load_requests.discard(request.request_id)\n        params = request.kv_transfer_params or {}\n        if not params.get(\"do_remote_prefill\"):\n            return self.pool.get_num_new_matched_tokens(request, num_computed_tokens)\n        if params.get(\"pool_pd_protocol\") != POOL_PD_PROTOCOL:\n            raise ValueError(\"Pool PD receive requires a compatible completed producer handoff\")\n        remote_mtp = params.get(\"pool_pd_mtp_tokens\", 0)\n        if type(remote_mtp) is not int or remote_mtp != self.mtp_tokens:\n            raise ValueError(\"Pool PD requires matching P/D speculative token counts\")\n        length = len(request.prompt_token_ids or ())\n        if params.get(\"remote_num_prompt_tokens\") != length:\n            raise ValueError(\"Pool PD handoff prompt length differs from the decode request\")\n        # Keep the existing CPD last-token recomputation. Draft cache is local.\n        count = max(0, length - 1 - num_computed_tokens)\n        if count:\n            self.pd_load_requests.add(request.request_id)\n        self.matches[request.request_id] = num_computed_tokens\n        return count, count > 0\n"
+    },
+    "pd-handoff": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_p2p/pd_pool/scheduler.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 117,
+      "end": 142,
+      "sha256": "3e021d08bd36b29d40730cd5351f452e356f86de0f46953f67c3c50f19a2afe4",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_p2p/pd_pool/scheduler.py#L117-L142",
+      "code": "    def request_finished(self, request, block_ids):\n        params = request.kv_transfer_params or {}\n        if params.get(\"do_remote_decode\") and request.status == RequestStatus.FINISHED_LENGTH_CAPPED:\n            if request.request_id not in self.tail_scheduled:\n                raise RuntimeError(\"Cannot hand off a prompt without its pool publication step\")\n            # wait_for_save completed before this model result was delivered.\n            # Objects remain in the pool; no HBM hold or remote delete ACK.\n            handoff = {\n                \"do_remote_prefill\": True,\n                \"do_remote_decode\": False,\n                \"pool_pd_protocol\": POOL_PD_PROTOCOL,\n                \"remote_num_prompt_tokens\": self.original_prompts.get(\n                    request.request_id, (len(request.prompt_token_ids), None)\n                )[0],\n            }\n            if self.need_truncate or self.mtp_tokens:\n                # This verifies the cache contract, not draft work requested\n                # from D. Each endpoint initializes its own draft state.\n                handoff[\"pool_pd_mtp_tokens\"] = self.mtp_tokens\n            logger.info(\n                \"Pool PD handoff req=%s prompt_tokens=%d cache_tokens=%d\",\n                request.request_id,\n                handoff[\"remote_num_prompt_tokens\"],\n                len(request.prompt_token_ids),\n            )\n            return False, handoff"
+    },
+    "pd-load": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_p2p/pd_pool/worker.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 89,
+      "end": 113,
+      "sha256": "30fa2a7b8a7a843dac74dadf3846b5390e0c6c0802407bf366d0742a0287feed",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_p2p/pd_pool/worker.py#L89-L113",
+      "code": "    def start_load(self, metadata):\n        self.transfer.start_load(metadata.pool)\n        for request in metadata.receives:\n            session = None\n            try:\n                session = self.transfer.io.begin(self._plans(request, tail_only=False, writing=False), writing=False)\n                self.transfer.io.copy(session)\n                self.transfer.io.finish(session)\n                logger.info(\n                    \"Pool PD GET req=%s cache_tokens=%s objects=%d bytes=%d\",\n                    request.request_id,\n                    request.cache_tokens,\n                    len(session.plans),\n                    sum(plan.size for plan in session.plans),\n                )\n            except Exception:\n                # Eviction between P completion and D acquisition is a miss,\n                # not permission to consume partly restored cache.\n                logger.exception(\"Pool PD receive failed for %s\", request.request_id)\n                self.results.failed_recving.add(request.request_id)\n            finally:\n                if session is not None:\n                    self.transfer.io.abort(session)\n            self.results.finished_recving.add(request.request_id)\n"
+    },
+    "state-snapshot": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 93,
+      "end": 102,
+      "sha256": "d49aa64a4045bdd991b1a674a46a61d105361eed4ea1381b45bc80a5a253a268",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/shared_layout.py#L93-L102",
+      "code": "    def snapshot(self, block_id, digest, cache_tokens):\n        if not 0 < block_id < self.num_blocks or cache_tokens <= 0:\n            raise ValueError(\"Circular snapshot requires an allocated block and computed prefix\")\n        ranges, offset = [], 0\n        for owner, base, stride, size in self._components:\n            ranges.append(PoolRange(owner, base + block_id * stride, offset, size))\n            offset += size\n        key = PoolKey(self.metadata, f\"pd_state_{cache_tokens}_{digest}\").to_string()\n        return (PoolObject(key, offset, block_id, tuple(ranges)),)\n"
+    },
+    "pin": {
+      "repo": "ascend",
+      "file": "vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 841,
+      "end": 870,
+      "sha256": "2858b20f0313de92760894ab9ad8205ed434d170e33f99ebc6c120c2aa37d791",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py#L841-L870",
+      "code": "    def touch_sending_mamba_blocks(self, req_meta: ReqMeta) -> None:\n        \"\"\"\n        Keep the reference of all non-null Mamba blocks sent to the external store.\n        \"\"\"\n        if not self.use_hybrid or not self.num_speculative_blocks_by_group or not req_meta.can_save:\n            return\n        # Layerwise transfer frees mamba blocks layer by layer on its own\n        # completion path (see KVCacheStoreSendingThread); bulk-touching them\n        # here would double-reference the block pool and leak blocks.\n        if self.use_layerwise:\n            return\n        using_event_id = self.get_sending_event_id()\n        req_meta.event_id = using_event_id\n        current_step_sending: list[int] = []\n        for group_id, num_speculative_blocks in self.num_speculative_blocks_by_group.items():\n            group_block_ids = req_meta.block_ids_by_group[group_id]\n            # The last num_speculative_blocks slots are speculative scratch\n            # blocks that the allocator relocates in place; relocation requires\n            # them exclusively owned (ref_cnt == 1), so they must never be\n            # pinned here (crashes allocate_new_blocks after vllm PR #51358).\n            non_spec_block_ids = (\n                group_block_ids[:-num_speculative_blocks] if num_speculative_blocks > 0 else group_block_ids\n            )\n            current_step_sending.extend([block_id for block_id in non_spec_block_ids if block_id > 0])\n        logger.debug(\"event: %s touch blocks: %s\", using_event_id, current_step_sending)\n        assert self._block_pool is not None\n        self._block_pool.touch([self._block_pool.blocks[block_id] for block_id in current_step_sending])\n        self.sending_events[using_event_id] = 0\n        self.sending_blocks[using_event_id] = current_step_sending\n"
+    },
+    "draft": {
+      "repo": "ascend",
+      "file": "vllm_ascend/worker/v2/attn_utils.py",
+      "commit": "80706e732d2bda1eea36e0e98ab1546f8706b00c",
+      "start": 405,
+      "end": 412,
+      "sha256": "a1ac51e785e010f0e508cbebcd9424263d9981d40d512e525b6964520571a4df",
+      "url": "https://github.com/Yuli-yx/vllm-ascend/blob/80706e732d2bda1eea36e0e98ab1546f8706b00c/vllm_ascend/worker/v2/attn_utils.py#L405-L412",
+      "code": "    # Ascend reconstructs several specs above, so propagate ownership after\n    # those transformations, including auxiliary indexer and recurrent caches.\n    # Older vLLM versions lack this metadata field; shared Store validates\n    # that capability separately instead of changing ordinary MTP execution.\n    for layer_name, spec in kv_cache_spec.items():\n        if getattr(attn_layers.get(layer_name), \"is_draft_layer\", False) and hasattr(spec, \"is_draft\"):\n            kv_cache_spec[layer_name] = replace(spec, is_draft=True)\n"
+    }
+  }
+}

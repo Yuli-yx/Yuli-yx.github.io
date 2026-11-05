@@ -1,0 +1,45 @@
+<section id="overview"><h2>先把四种状态放到一张图里</h2>
+<p>GLM-5.3-Flash 在这份 Ascend 实现中对应 <code>glm5next</code>。它不是“每层都保存普通 K/V”的单一 attention 模型：主干按配置选择 <b>MLA attention 或 KDA linear attention</b>；带稀疏索引的 MLA 又有独立的压缩 indexer 和未完成压缩组的环形状态。模型还有 MoE、MTP 等组件，但专家权重与路由不是本专题要传的 cache。</p>
+<div class="cache-atlas"><div class="atlas-main"><span>MLA / 稀疏 attention</span><b>历史 latent KV</b><p>按 token 分页，保存用于实际 attention 的历史内容。</p><div class="atlas-sub"><b>KeyPool indexer</b><p>压缩 key → 选 Top-K 历史位置</p><b>环形 K / gate</b><p>保留尚未完成压缩的输入与投机余量</p></div></div><div class="atlas-state"><span>KDA / 线性 attention</span><b>卷积历史 + 递归矩阵</b><p>历史被更新到状态中。恢复某个前缀，需要那个前缀边界的 checkpoint。</p></div></div>
+<p><b>Indexer 是选择历史位置的辅助路径，不是第三套独立的主干 attention。</b>此外，模型内部的 <em>KeyPool</em> 是压缩索引机制；外部 <em>KV pool / Ascend Store</em> 是跨请求、跨实例存取 cache 的存储机制。名字接近，职责完全不同。</p>
+<p>以下以固定源码解释缓存机制；层数与分布以部署权重配置为准。实际层序列由 <code>layer_types</code> 决定；MTP 层在这里走 MLA 分支，不按主干 KDA 层类型选择。</p>{{source:layer-choice}}
+<div class="flow"><div class="node"><b>输入 hidden states</b>进入 decoder layer</div><span class="arrow">→</span><div class="node"><b>按 layer_types 选择</b>KDA，或 MLA（可带稀疏 indexer）</div><span class="arrow">→</span><div class="node"><b>残差与 FFN / MoE</b>专家并行处理本层输出</div><span class="arrow">→</span><div class="node"><b>后续层与输出</b>target logits → 采样 / 投机验证</div></div>
+</section>
+<section id="attention"><h2>三条计算路径，四类持久内容</h2>
+<table><thead><tr><th>路径</th><th>做什么</th><th>需要留到下一步的内容</th><th>共享难点</th></tr></thead><tbody>
+<tr><td>MLA</td><td>用低维 latent 表示历史 KV，再执行 attention；稀疏版本按索引选择历史位置</td><td>主 latent cache；RoPE 部分取决于模型配置，本次观测到 NoPE 主 cache 的 rope view 为空</td><td>不能套用普通每 head 各一份 K/V 的地址假设</td></tr>
+<tr><td>KeyPool indexer</td><td>将若干 token 的 key/gate 聚合成压缩 key，参与历史 Top-K 选择</td><td>已完成的压缩 key；可选量化布局还可能有 scale</td><td>逻辑 token 数不等于压缩 cache 行数；没完成的一组不能当有效行写池</td></tr>
+<tr><td>KDA</td><td>卷积处理局部历史，再更新递归状态；prefill 与 decode 可走不同算子路径</td><td>conv state 与 recurrent state</td><td>原地更新；前缀命中必须恢复同一边界状态，不能只找历史 KV</td></tr>
+<tr><td>Indexer 环形 tail</td><td>保存未完成压缩组及投机 lookahead 的 raw key/gate</td><td>请求独占的 FP32 环形页</td><td>不是完整前缀块；同一页会反复覆盖，PD 任意交接边界需要精确快照</td></tr>
+</tbody></table>
+<p>可以这样理解 KDA：attention 的历史信息压进了一个不断更新的状态，而不是保留所有 token 的完整 K/V。为了支持前缀恢复，运行时仍可能保存多个可复用 checkpoint；“状态大小固定”不意味着整个服务只分配一个 state。</p>
+</section>
+<section id="management"><h2>Ascend 怎么管理这些 cache</h2>
+<div class="flow"><div class="node"><b>模型声明 spec</b>主 attention、indexer、tail 和 KDA 各自声明缓存需求</div><span class="arrow">→</span><div class="node"><b>Engine 规划 group</b>确定块粒度、page 成本、分组与 block 数</div><span class="arrow">→</span><div class="node"><b>Worker 建立 view</b>原始 backing → shape / stride / component offset</div><span class="arrow">→</span><div class="node"><b>Scheduler 分配使用权</b>请求 block table 与 checkpoint 引用</div></div>
+<p>Indexer 与 tail 通过 <code>AttentionLayerBase</code> 注册到静态上下文，但它们设置了 <code>align_kv_cache_with_mamba=False</code>，有模型专用的小页布局。KDA 则用 Mamba/SSM 的状态管理和对齐 checkpoint 契约。<b>同组共享的是 block 管理规则，不代表不同层共享同一份内容。</b></p>
+<p>必须分清三种粒度：scheduler 的逻辑 block、算子读取的 kernel page、prefix hash 的粒度。本次模型实验实际逻辑块为 <b>640 tokens</b>；MLA kernel page 为 128 tokens，因此一逻辑块覆盖 5 个 kernel pages。CLI 输入 128 不能直接当作最终逻辑块大小。</p>
+<p>继续阅读背景：<a href="kv-basics.html">tensor / block / group 概念地图</a>、<a href="kv-initialization.html">从 spec 到设备 tensor</a>。</p>
+</section>
+<section id="layout"><h2>实测布局：shape 不是完整地址契约</h2>
+<p>下表来自前一版同步实现的 Flash BF16、TP8 模型布局记录。<code>Bₖ</code> 表示 kernel page 数，<code>Bₛ</code> 表示状态页数，不可混用。数值是观测样例，适配器从实际 spec/tensor 推导，不按这些数字硬编码。</p>
+<table><thead><tr><th>组件</th><th>MTP=0 的观测 view</th><th>MTP=1 的变化</th><th>存储语义</th></tr></thead><tbody>
+<tr><td>主 MLA latent</td><td>BF16 (Bₖ, 128, 1, 512)</td><td>主干示例不变；排除额外 draft owners</td><td>TP 复制内容，rank 0 写、各 rank 读</td></tr>
+<tr><td>压缩 indexer</td><td>BF16 (Bₖ, 32, 1, 128)，压缩比 4</td><td>已完成组仍按同一压缩比例</td><td>每逻辑块 160 个压缩行；不是 640 行</td></tr>
+<tr><td>KDA conv</td><td>BF16 (Bₛ, 3, 3072)</td><td>(Bₛ, 4, 3072)</td><td>历史窗口因 lookahead 增长</td></tr>
+<tr><td>KDA recurrent</td><td>FP32 (Bₛ, 8, 128, 128)</td><td>该样例组件形状不变，但页内起点变化</td><td>TP 本地状态；按 checkpoint 恢复</td></tr>
+<tr><td>环形 tail</td><td>FP32 (Bₛ, 4, 256)</td><td>(Bₛ, 5, 256)</td><td>最后一维为 K/gate 两部分；请求生命周期</td></tr>
+</tbody></table>
+<div class="flash-lab" data-layout-lab><div class="lab-heading"><b>页内有效数据与 padding</b><label>MTP tokens <select name="mtp"><option value="0">0</option><option value="1">1</option></select></label></div><p>选择配置，观察 conv 增长如何改变 recurrent 的字节偏移。这里只演算上述实测页，不模拟执行。</p><div class="byte-lane" data-state-lane></div><div class="byte-lane" data-ring-lane></div><output aria-live="polite"></output></div>
+<p>KDA 实测页跨度 655,360 B。MTP=0 时 conv 占 18,432 B，recurrent 占 524,288 B；MTP=1 时 conv 占 24,576 B。环形页跨度 40,960 B，但有效内容仅 4,096 / 5,120 B。<b>把 page stride 当作有效 payload 长度，会把 padding 一起传走；把 shape 当作连续地址，也可能读错下一个 block。</b></p>{{source:ring-view}}{{source:kda-shape}}
+</section>
+<section id="compressed"><h2>压缩尾部与投机状态：为什么不能漏</h2>
+<p>压缩比为 4 时，只有位置满足 <code>(position + 1) % 4 == 0</code> 才产生一个完成的压缩组。比如已计算 799 tokens，已完成 199 组，还剩 3 tokens 的尾部历史。恢复时只搬 199 行压缩 key 不够，下一 token 完成新组时还需要这些历史 raw key/gate。</p>{{source:compressed-slot}}
+<p>环形容量采用 <code>compress_ratio + num_speculative_tokens</code>。MTP 验证会先写入候选 token 的中间数据，再进行接受/拒绝判定；额外容量避免未接受的候选覆盖后续重放仍需要的历史。<b>环形缓冲里有内容，不代表这些 token 都已提交。</b></p>{{source:ring-capacity}}
+<p>KDA 同样有提交时刻问题。RecoverSSM 分支在验证阶段记录更新，MRV2 在拒绝采样后提交。因此层计算结束事件只表示对应算子已完成，不能被解释为“所有投机状态均已接受”。外部池化必须使用既有 committed checkpoint 选择和保存范围，而不是重新定义投机算法。</p>{{source:kda-commit}}
+</section>
+<section id="recover"><h2>一个可恢复点必须包含什么</h2>
+<table><thead><tr><th>恢复方式</th><th>需要的内容</th><th>边界</th></tr></thead><tbody>
+<tr><td>普通前缀池命中</td><td>完整 attention 块 + 同一边界可用的 recurrent checkpoint</td><td>所有组件共同可恢复的完整边界；环形状态交给对齐前缀重放</td></tr>
+<tr><td>PD 任意 prompt 交接</td><td>完整块 + 有效 attention 尾块 + 精确 recurrent 状态 + 环形 tail</td><td>原始 prompt 与 P 实际计算边界必须一致</td></tr>
+<tr><td>MTP</td><td>目标模型的有效恢复状态；draft 在 D 本地初始化</td><td>本阶段 P/D MTP 数必须相同；不能因排除了 draft 就忽略 target 布局变化</td></tr>
+</tbody></table><p>下一篇从这个“可恢复点”出发，解释为什么共池既需要改对象身份，也需要明确 value 的字节契约。</p></section>
