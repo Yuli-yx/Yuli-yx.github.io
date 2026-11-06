@@ -1,0 +1,323 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="把模型缓存需求换算成页大小、分组和字节地址，区分每层页、池 ID 与共享 backing。"><title>Cache spec、group 与物理布局｜推理系统源码读本</title><link rel="stylesheet" href="assets/book/styles.css"></head><body><a class="skip" href="#main">跳到正文</a><div id="progress"></div><button id="menu" aria-label="打开目录" aria-expanded="false">☰ 目录</button><aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">kv<span>·</span></span><strong>推理系统源码读本<small>vLLM × vLLM-Ascend</small></strong></a><div class="topic-label">专题导航</div><nav class="topic-nav" aria-label="全站专题"><a href="index.html" >总览 · 推理系统源码读本</a><a href="kv-outline.html" class="selected-topic">KV Cache 管理<small>已写 7 章</small></a><a href="index.html#pd" >P/D 分离<small>规划</small></a><a href="index.html#pool" >KV Pool 池化<small>规划</small></a><a href="index.html#cp" >PCP / DCP<small>规划</small></a><a href="courses/model-runner/index.html" >Model Runner<small>已有</small></a></nav><p class="community-link"><a href="contributing.html">共建说明：要求、计划与接续方法 →</a></p><div class="book-label">KV CACHE 管理 / 第 04 章</div><div class="current-chapter"><strong>Cache spec、group 与物理布局</strong></div><nav aria-label="本章目录"><a href="#spec-contract">1. Spec 描述需求，不持有缓存数据</a><a href="#page-bytes">2. 从元素数算到页字节数</a><a href="#group-semantics">3. Group 共享 block table，不等于层共享 K/V 数值</a><a href="#physical-placement">4. 用 offset 和 stride 找到真实字节</a><a href="#group-overlay">5. 多个 group 为什么可以覆盖同一 backing？</a><a href="#layout-checklist">6. 把四种“大小”放回各自位置</a></nav><details class="book-outline"><summary>本专题大纲 <span>16 章</span></summary><p><a href="kv-outline.html">查看完整目录与模型案例 →</a></p><ol><li><span>01</span><a href="kv-cache.html">谁在管理 KV Cache？</a><small>已编写</small></li><li><span>02</span><a href="kv-attention.html">Attention 结构决定缓存什么</a><small>已编写</small></li><li><span>03</span><a href="kv-model-path.html">从模型配置找到真实实现</a><small>已编写</small></li><li><span>04</span><a href="kv-layout.html" aria-current="page">Cache spec、group 与物理布局</a><small>本章</small></li><li><span>05</span><a href="kv-initialization.html">启动时怎样建立缓存池</a><small>已编写</small></li><li><span>06</span><a href="kv-request-step.html">一轮请求怎样分配、写入和读取</a><small>已编写</small></li><li><span>07</span><a href="kv-reuse.html">复用、回收与恢复</a><small>已编写</small></li><li><span>08</span><a href="kv-outline.html#chapter-08">普通 GQA 模型：完整基线案例</a><small>待写</small></li><li><span>09</span><a href="kv-outline.html#chapter-09">Qwen3.5 / Qwen3.6：Full Attention + GDN</a><small>待写</small></li><li><span>10</span><a href="kv-outline.html#chapter-10">Kimi K3：MLA + KDA</a><small>待写</small></li><li><span>11</span><a href="kv-outline.html#chapter-11">DeepSeek V4：压缩与多类缓存</a><small>待写</small></li><li><span>12</span><a href="kv-outline.html#chapter-12">GLM-5.3：稀疏 Attention 缓存链路</a><small>待写</small></li><li><span>13</span><a href="kv-outline.html#chapter-13">GLM-5.3-Flash：混合 Attention 与辅助状态</a><small>待写</small></li><li><span>14</span><a href="kv-outline.html#chapter-14">同一个请求，在不同模型里会发生什么？</a><small>待写</small></li><li><span>15</span><a href="kv-outline.html#chapter-15">如何算准一个真实模型的缓存容量？</a><small>待写</small></li><li><span>16</span><a href="kv-outline.html#chapter-16">接到系统专题：并行、传输与池化</a><small>待写</small></li></ol></details></aside><div class="page"><header class="topbar"><span><a href="index.html">专题总览</a> / <a href="kv-outline.html">KV Cache 目录</a></span><button id="reading" aria-pressed="false">宽屏阅读</button></header><main id="main"><div class="eyebrow">CHAPTER 04<span>源码 · 例子 · 计算过程</span></div><h1>Cache spec、group 与物理布局</h1><p class="dek">把模型缓存需求换算成页大小、分组和字节地址，区分每层页、池 ID 与共享 backing。</p><div class="version"><b>源码基线 / 2026.10.25</b><span>vLLM 2f1041e8dd · Ascend e07bf18b76</span><span>章节更新 / 2026.11.06</span></div><div class="intro"><p>前两章分别讲“谁管理缓存”和“Attention 要保存什么”。这一章把两者接起来：模型声明的缓存需求，怎样变成管理器能分配的 block，又怎样对应设备 tensor 的一段字节？读完后，你应该能从一个 spec 算出页大小，从一个 block ID 找到某层的页起点，并解释为什么把所有 tensor 的大小相加会重复计数。</p><p>本章沿用 vLLM <code>2f1041e8dd</code> 与 vLLM-Ascend <code>e07bf18b76</code>。先讨论单 rank、普通 causal GQA、BF16、无量化、无投机解码、无 KV 传输的例子；后面再引入混合 group。这里的数字用于手算，不代表某个模型或 backend 支持的实际启动参数。</p></div>
+<section id="spec-contract"><h2>1. Spec 描述需求，不持有缓存数据</h2><p>模型层的 <code>get_kv_cache_spec()</code> 返回一个描述对象。它告诉规划器这一类缓存如何计算容量、覆盖多少 token、如何分配；并不会在这个调用里为每个请求创建 K/V tensor。第三章提到的 backend 定制可能改变声明，因此我们这里读的是规划时实际采用的 spec。</p><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>字段 / 属性</th><th>含义</th><th>普通 GQA 示例</th></tr></thead><tbody><tr><td><code>block_size</code></td><td>一个管理 block 覆盖的 token 范围；不要当作字节数</td><td>4 token</td></tr><tr><td><code>num_kv_heads</code></td><td>这一份缓存声明中的 KV head 数；并行时须核对本 rank 的值</td><td>2</td></tr><tr><td><code>head_size / head_size_v</code></td><td>每个 K / V head 的元素数，二者不必相等</td><td>8 / 8</td></tr><tr><td><code>dtype</code></td><td>普通数值元素的数据类型</td><td>BF16，2 bytes / element</td></tr><tr><td><code>tokens_per_state</code></td><td>一份存储状态覆盖多少 token</td><td>1</td></tr><tr><td><code>page_size_bytes</code></td><td>这一层一个管理页占用的字节数，可能含 padding</td><td>256 bytes</td></tr></tbody></table></div><p>这里把“层的一页”与“池中一个 block ID 的全部物理容量”分开叫。一个 group 可以有多层：管理器给这个 group 分配一个 ID，就要为该组的每层提供对应页。于是，一层的 <code>page_size_bytes</code> 通常不是整个池每个 ID 的字节成本。</p><details class="source" id="src-m-attention-spec"><summary><span>源码证据</span>普通 Attention 的状态内容与页字节数<small>vllm · 2f1041e8dd · L563–586</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L563-L586" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/kv_cache_interface.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 563
+ 564      @property
+ 565      def num_heads(self) -&gt; int:
+ 566          if self.num_head_slots is not None:
+ 567              return self.num_head_slots
+ 568          return self.num_kv_heads
+ 569
+ 570      @property
+ 571      def state_content_size_bytes(self) -&gt; int:
+<span class="code-comment">      # [讲解补充] 普通格式按 K 和 V 的维度之和计费；打包格式可以直接覆盖 cell 字节数。</span>
+ 572          &quot;&quot;&quot;Bytes per (head slot, stored state) cell of the page.&quot;&quot;&quot;
+ 573          if self.state_content_bytes is not None:
+ 574              return self.state_content_bytes
+ 575          return (self.head_size + self.head_size_v) * get_dtype_size(self.dtype)
+ 576
+ 577      @property
+ 578      def unpadded_page_size_bytes(self) -&gt; int:
+ 579          return self.num_heads * self.num_states * self.state_content_size_bytes
+ 580
+ 581      @property
+<span class="code-comment">      # [讲解补充] page_size_bytes 是分配口径；有 padding 时不能只算有效数值。</span>
+ 582      def page_size_bytes(self) -&gt; int:
+ 583          if self.page_size_padded is not None:
+ 584              assert self.page_size_padded &gt;= self.unpadded_page_size_bytes
+ 585              return self.page_size_padded
+ 586          return self.unpadded_page_size_bytes</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 563
+ 564      @property
+ 565      def num_heads(self) -&gt; int:
+ 566          if self.num_head_slots is not None:
+ 567              return self.num_head_slots
+ 568          return self.num_kv_heads
+ 569
+ 570      @property
+ 571      def state_content_size_bytes(self) -&gt; int:
+ 572          &quot;&quot;&quot;Bytes per (head slot, stored state) cell of the page.&quot;&quot;&quot;
+ 573          if self.state_content_bytes is not None:
+ 574              return self.state_content_bytes
+ 575          return (self.head_size + self.head_size_v) * get_dtype_size(self.dtype)
+ 576
+ 577      @property
+ 578      def unpadded_page_size_bytes(self) -&gt; int:
+ 579          return self.num_heads * self.num_states * self.state_content_size_bytes
+ 580
+ 581      @property
+ 582      def page_size_bytes(self) -&gt; int:
+ 583          if self.page_size_padded is not None:
+ 584              assert self.page_size_padded &gt;= self.unpadded_page_size_bytes
+ 585              return self.page_size_padded
+ 586          return self.unpadded_page_size_bytes</code></pre></details></details></section>
+<section id="page-bytes"><h2>2. 从元素数算到页字节数</h2><p>先计算一个 token 在一层中的 K 和 V。K 有 <code>2 heads × 8 elements = 16 elements</code>；V 也有 16 个元素。两者合计 32 个 BF16 元素，乘每元素 2 bytes，得到 64 bytes。一个 block 覆盖 4 token，所以：</p><pre><code>每 token、每层：Hkv × (Dk + Dv) × s
+                 = 2 × (8 + 8) × 2 = 64 bytes
+每页、每层：     B × Hkv × (Dk + Dv) × s
+                 = 4 × 2 × 16 × 2 = 256 bytes</code></pre><p><code>B</code> 是每页 token 数，<code>Hkv</code> 是本 rank 的 KV head 数，<code>Dk/Dv</code> 是 K/V head 维度，<code>s</code> 是元素字节数。常见写法 <code>2 × B × Hkv × D × s</code> 隐含了 <code>Dk = Dv = D</code>，前面的 2 才代表 K 与 V。</p><p>源码进一步把页看成 head slot、stored state 和 cell content 三个维度：<code>num_heads × num_states × state_content_size_bytes</code>。普通例子中它们分别是 2、4、32 bytes，因此仍然是 256 bytes。若 backend 设置 <code>num_head_slots</code> 或 <code>state_content_bytes</code>，应读这些覆盖值，不能继续套普通 KV 公式。</p><p>假设一个教学压缩 spec 的 <code>tokens_per_state = 4</code>、<code>block_size = 16</code>，并满足实现的整除条件，那么每页有 <code>16 / 4 = 4</code> 份 stored state，而不是 16 份。具体状态的字节数仍由该 spec 决定。对 recurrent state，<code>MambaSpec</code> 按多份 shape 和 dtype 求和：例如 <code>[2,8,8]</code> FP32 为 512 bytes，<code>[3,32]</code> BF16 为 192 bytes，合计 704 bytes；这是一份状态集合的大小，不应再乘历史 token 数。</p><p>如果普通页的有效数值占 256 bytes，但 <code>page_size_padded = 320</code>，分配记账就采用 320 bytes，额外 64 bytes 是页 padding。它既不是新 token 的 K/V，也不是请求尾块的空位。这两个来源的浪费应分别记录。</p><details class="source" id="src-m-state-count"><summary><span>源码证据</span>每个管理页的 stored state 数<small>vllm · 2f1041e8dd · L252–260</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L252-L260" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/kv_cache_interface.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 252
+ 253      @property
+ 254      def num_states(self) -&gt; int:
+ 255          return self.get_num_kernel_states(self.block_size)
+ 256
+<span class="code-comment">      # [讲解补充] tokens_per_state 为正时，把原始 token 覆盖数换算成存储状态数。</span>
+ 257      def get_num_kernel_states(self, kernel_block_size: int) -&gt; int:
+ 258          if self.tokens_per_state &gt; 0:
+ 259              return kernel_block_size // self.tokens_per_state
+ 260          return 1</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 252
+ 253      @property
+ 254      def num_states(self) -&gt; int:
+ 255          return self.get_num_kernel_states(self.block_size)
+ 256
+ 257      def get_num_kernel_states(self, kernel_block_size: int) -&gt; int:
+ 258          if self.tokens_per_state &gt; 0:
+ 259              return kernel_block_size // self.tokens_per_state
+ 260          return 1</code></pre></details></details><details class="source" id="src-m-state-bytes"><summary><span>源码证据</span>状态型缓存按各 shape 和 dtype 求和<small>vllm · 2f1041e8dd · L1094–1114</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L1094-L1114" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/kv_cache_interface.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1094      @property
+1095      def state_content_size_bytes(self) -&gt; int:
+<span class="code-comment">      # [讲解补充] 先逐项算元素数 × 每元素字节数；不同状态可以使用不同 dtype。</span>
+1096          return sum(
+1097              prod(shape) * get_dtype_size(dtype)
+1098              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1099          )
+1100
+1101      @property
+1102      def real_page_size_bytes(self) -&gt; int:
+1103          return self.state_content_size_bytes
+1104
+1105      @property
+1106      def page_size_bytes(self) -&gt; int:
+1107          page_size = sum(
+1108              prod(shape) * get_dtype_size(dtype)
+1109              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1110          )
+1111          if self.page_size_padded is not None:
+1112              assert self.page_size_padded &gt;= page_size
+1113              return self.page_size_padded
+1114          return page_size</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1094      @property
+1095      def state_content_size_bytes(self) -&gt; int:
+1096          return sum(
+1097              prod(shape) * get_dtype_size(dtype)
+1098              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1099          )
+1100
+1101      @property
+1102      def real_page_size_bytes(self) -&gt; int:
+1103          return self.state_content_size_bytes
+1104
+1105      @property
+1106      def page_size_bytes(self) -&gt; int:
+1107          page_size = sum(
+1108              prod(shape) * get_dtype_size(dtype)
+1109              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1110          )
+1111          if self.page_size_padded is not None:
+1112              assert self.page_size_padded &gt;= page_size
+1113              return self.page_size_padded
+1114          return page_size</code></pre></details></details></section>
+<section id="group-semantics"><h2>3. Group 共享 block table，不等于层共享 K/V 数值</h2><p><code>KVCacheGroupSpec</code> 将一组模型层交给同一种管理方式。组内层共享请求的 block table。假设 G0 包含 L0、L1 两层，请求 A 在 G0 的表为 <code>[5,2,7]</code>：A 的第 0 个逻辑 block 在 L0 中用页 5，在 L1 中也用页 5。但 L0 和 L1 的页 5 通常处于不同的字节区间，保存各自层的 K/V。</p><p>不能只因为两个层的 dtype、head 维度相同，就认定它们一定同组。Full Attention 需要保留完整历史，滑窗层可能提前释放页，递归层还需要状态恢复位置。规划器必须让组内层能共同遵循分配、命中和回收规则。这个版本也支持 <code>UniformTypeKVCacheSpecs</code>，把需要相同 token 槽位数量、但逐层具体尺寸不同的 spec 放进一个 group；因此“一个 group 的所有层 shape 必须完全一样”也不准确。</p><p>默认规划路径先检查完全一致的 spec，再检查兼容的 uniform type，然后尝试其他分组与页大小统一方案。模型或平台还可以提供自己的 builder。读一个实际模型时，应先记下最终的 <code>layer_names</code> 和 <code>kv_cache_spec</code>，再讨论 group 数量，不从层数比例猜分组结果。</p><details class="source" id="src-m-group"><summary><span>源码证据</span>Cache group 的表共享约定<small>vllm · 2f1041e8dd · L1484–1502</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L1484-L1502" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/kv_cache_interface.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1484  @dataclass
+<span class="code-comment">      # [讲解补充] 这里共享的是索引和管理方式，不意味着各层 K/V 数值相同。</span>
+1485  class KVCacheGroupSpec:
+1486      &quot;&quot;&quot;Represents a group of model layers that share the same KV cache block table.
+1487      These layers are regarded as one layer in the KV cache manager.
+1488      &quot;&quot;&quot;
+1489
+1490      # The names of model layers in this group
+1491      layer_names: list[str]
+1492      # The KV cache spec of this manager layer
+1493      kv_cache_spec: KVCacheSpec
+1494      # Whether this group holds draft layers and takes the EAGLE last-block drop.
+1495      is_eagle_group: bool = False
+1496      # Host groups use the dedicated HiSparse pool; others share the device pool.
+1497      host_resident: bool = False
+1498      # Whether this group is part of the externally transferable KV state.
+1499      # Ephemeral accelerator-side replicas are rebuilt from their transferable
+1500      # source group after a connector load.
+1501      enable_kv_transfer: bool = True
+1502      role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1484  @dataclass
+1485  class KVCacheGroupSpec:
+1486      &quot;&quot;&quot;Represents a group of model layers that share the same KV cache block table.
+1487      These layers are regarded as one layer in the KV cache manager.
+1488      &quot;&quot;&quot;
+1489
+1490      # The names of model layers in this group
+1491      layer_names: list[str]
+1492      # The KV cache spec of this manager layer
+1493      kv_cache_spec: KVCacheSpec
+1494      # Whether this group holds draft layers and takes the EAGLE last-block drop.
+1495      is_eagle_group: bool = False
+1496      # Host groups use the dedicated HiSparse pool; others share the device pool.
+1497      host_resident: bool = False
+1498      # Whether this group is part of the externally transferable KV state.
+1499      # Ephemeral accelerator-side replicas are rebuilt from their transferable
+1500      # source group after a connector load.
+1501      enable_kv_transfer: bool = True
+1502      role: KVCacheGroupRole = KVCacheGroupRole.DEFAULT</code></pre></details></details><details class="source" id="src-m-grouping"><summary><span>源码证据</span>相同 spec 与兼容 uniform type 的分组分支<small>vllm · 2f1041e8dd · L1138–1148</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_planning.py#L1138-L1148" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/kv_cache_planning.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1138      if is_kv_cache_spec_uniform(kv_cache_spec):
+1139          # KV cache of all layers are the same, which is true for
+1140          # most models. Allocate the same amount of memory for
+1141          # each layer.
+1142          return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+<span class="code-comment">      # [讲解补充] 同样需要一组 token 槽位的层，可以按 uniform type 合组；仍需读取逐层 spec。</span>
+1143      elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
+1144          # All layers need the same number of token slots (e.g., all layers are
+1145          # full attention, or all layers are sliding window attention with the
+1146          # same window size). Put all layers into one group.
+1147          return _get_kv_cache_groups_uniform_type(uniform_spec)
+1148      # Hidden-state layers use their own block table and must not be absorbed</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1138      if is_kv_cache_spec_uniform(kv_cache_spec):
+1139          # KV cache of all layers are the same, which is true for
+1140          # most models. Allocate the same amount of memory for
+1141          # each layer.
+1142          return _get_kv_cache_groups_uniform_spec(kv_cache_spec)
+1143      elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(kv_cache_spec):
+1144          # All layers need the same number of token slots (e.g., all layers are
+1145          # full attention, or all layers are sliding window attention with the
+1146          # same window size). Put all layers into one group.
+1147          return _get_kv_cache_groups_uniform_type(uniform_spec)
+1148      # Hidden-state layers use their own block table and must not be absorbed</code></pre></details></details></section>
+<section id="physical-placement"><h2>4. 用 offset 和 stride 找到真实字节</h2><p><code>KVCacheTensor</code> 在这里仍是分配描述。它给出 backing 大小、层列表、起始 offset、层 stride 和 block stride。某个描述中的第 <code>l</code> 层、物理 block <code>b</code> 的页起点是：</p><pre><code>page_start_bytes = offset + l × layer_stride + b × block_stride</code></pre><p>这里所有 offset/stride 的单位都是 bytes，<code>l</code> 是当前 <code>layers</code> 列表的下标，不一定等于模型的全局层号。这个公式只定位页起点；页内 K/V、head、token 的排列还要按 layout 与 backend 的 view 解释，不能直接把 slot 当作 byte offset。</p><details class="source" id="src-m-placement"><summary><span>源码证据</span>KVCacheTensor 的字节定位契约<small>vllm · 2f1041e8dd · L1454–1475</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L1454-L1475" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/kv_cache_interface.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1454  @dataclass
+1455  class KVCacheTensor:
+1456      &quot;&quot;&quot;A class for specifying how the workers should initialize the KV cache.
+1457
+<span class="code-comment">      # [讲解补充] l 是本描述 layers 列表的下标；offset 和 stride 的单位均为 bytes。</span>
+1458      Placement of a set of same-shaped layers in the KV cache allocation.
+1459      Layer ``layers[l]``'s page for block ``b`` starts at
+1460      ``offset + l * layer_stride + b * block_stride`` bytes into the backing
+1461      allocation of ``size`` bytes. Layer-outermost layouts give each layer a
+1462      contiguous region (``layer_stride = page * num_blocks``,
+1463      ``block_stride = page``); block-outermost layouts make each block a
+1464      block of all layers' pages (``layer_stride = page``, ``block_stride`` =
+1465      the packed block). Tensors whose address ranges overlap
+1466      alias the same bytes: cache groups overlay each other, which is sound
+1467      because a block ID is owned by one group at a time.
+1468      &quot;&quot;&quot;
+1469
+1470      size: int  # total size of the backing allocation in bytes
+1471      layers: list[str]  # layer names in L order
+1472      layer_stride: int
+1473      block_stride: int
+1474      offset: int = 0  # byte offset of layers[0]'s block 0
+1475      host_resident: bool = False</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1454  @dataclass
+1455  class KVCacheTensor:
+1456      &quot;&quot;&quot;A class for specifying how the workers should initialize the KV cache.
+1457
+1458      Placement of a set of same-shaped layers in the KV cache allocation.
+1459      Layer ``layers[l]``'s page for block ``b`` starts at
+1460      ``offset + l * layer_stride + b * block_stride`` bytes into the backing
+1461      allocation of ``size`` bytes. Layer-outermost layouts give each layer a
+1462      contiguous region (``layer_stride = page * num_blocks``,
+1463      ``block_stride = page``); block-outermost layouts make each block a
+1464      block of all layers' pages (``layer_stride = page``, ``block_stride`` =
+1465      the packed block). Tensors whose address ranges overlap
+1466      alias the same bytes: cache groups overlay each other, which is sound
+1467      because a block ID is owned by one group at a time.
+1468      &quot;&quot;&quot;
+1469
+1470      size: int  # total size of the backing allocation in bytes
+1471      layers: list[str]  # layer names in L order
+1472      layer_stride: int
+1473      block_stride: int
+1474      offset: int = 0  # byte offset of layers[0]'s block 0
+1475      host_resident: bool = False</code></pre></details></details>
+<p>取单 group、两层、每层每页 256 bytes、8 个物理 ID，总 backing 为 <code>2 × 256 × 8 = 4096 bytes</code>。在不需要额外对齐的教学布局中，可以这样安排：</p><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>布局</th><th>layer_stride</th><th>block_stride</th><th>L1 的 block 5 起点</th></tr></thead><tbody><tr><td>layer-outer：先摆完 L0 所有页，再摆 L1</td><td>8 × 256 = 2048 bytes</td><td>256 bytes</td><td>0 + 1 × 2048 + 5 × 256 = 3328 bytes</td></tr><tr><td>block-outer：每个 ID 先摆 L0、L1 两页</td><td>256 bytes</td><td>2 × 256 = 512 bytes</td><td>0 + 1 × 256 + 5 × 512 = 2816 bytes</td></tr></tbody></table></div><p>同样的 block table 和同样的 4096 bytes，布局可以不同。这正是管理索引与物理排布分开的意义：请求仍通过 ID 5 找页，worker 用确定的布局把它解释成设备地址。</p></section>
+<section id="group-overlay"><h2>5. 多个 group 为什么可以覆盖同一 backing？</h2><p>再构造一个已完成分组的教学配置，使用 block-outer 布局。G0 的两层每层页 256 bytes，合计 512 bytes；G1 的一层页 384 bytes。假设相关对齐已经满足，规划器以较大的 512 bytes 作为每个池 ID 的跨度。8 个 ID 的 backing 仍为 4096 bytes。G1 使用某个 ID 时，384 bytes 放有效页，剩余 128 bytes 不属于该页的有效内容。</p><p>G0 和 G1 的 view 都可以描述全部 8 个 ID，并从同一 backing 的起点建立视图。但分配器不允许 G0 和 G1 同时占用同一个物理 ID。比如请求 A 的 G0 表为 <code>[5,2,7]</code>，G1 表为 <code>[1,3,4]</code>，两组共有六个不同 ID。G0 的 block 5 与 G1 的 block 1 不会冲突；如果两组同时把 ID 5 当自己的有效页，就会覆盖对方数据。</p><details class="source" id="src-m-pool-stride"><summary><span>源码证据</span>默认池按最大 group 计算每个 ID 的物理成本<small>vllm · 2f1041e8dd · L574–605</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_planning.py#L574-L605" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/kv_cache_planning.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 574  def _get_kv_cache_bytes_per_block(
+ 575      kv_cache_groups: list[KVCacheGroupSpec], layout: KVCacheLayout
+ 576  ) -&gt; int:
+ 577      &quot;&quot;&quot;Return the largest cache group's bytes per block.&quot;&quot;&quot;
+<span class="code-comment">      # [讲解补充] layer-outer 布局按各组的层跨度总和取最大值。</span>
+ 578      if not layout.is_block_outermost:
+ 579          # Each layer's block stride is its own padded page.
+ 580          return max(
+ 581              sum(
+ 582                  _get_layer_block_stride(_get_per_layer_spec(group, layer_name))
+ 583                  for layer_name in group.layer_names
+ 584              )
+ 585              for group in kv_cache_groups
+ 586          )
+<span class="code-comment">      # [讲解补充] block-outer 布局先比较组内页大小总和，随后还会满足对齐要求。</span>
+ 587      bytes_per_block = max(
+ 588          sum(
+ 589              _get_per_layer_spec(group, layer_name).page_size_bytes
+ 590              for layer_name in group.layer_names
+ 591          )
+ 592          for group in kv_cache_groups
+ 593      )
+ 594      assert bytes_per_block &gt; 0
+ 595      alignments = [
+ 596          group.kv_cache_spec.page_size_bytes
+ 597          for group in kv_cache_groups
+ 598          if isinstance(group.kv_cache_spec, HiSparseHotSpec)
+ 599      ]
+ 600      alignments.extend(
+ 601          _get_per_layer_spec(group, layer_name).get_block_stride_alignment()
+ 602          for group in kv_cache_groups
+ 603          for layer_name in group.layer_names
+ 604      )
+ 605      return round_up(bytes_per_block, math.lcm(*alignments))</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 574  def _get_kv_cache_bytes_per_block(
+ 575      kv_cache_groups: list[KVCacheGroupSpec], layout: KVCacheLayout
+ 576  ) -&gt; int:
+ 577      &quot;&quot;&quot;Return the largest cache group's bytes per block.&quot;&quot;&quot;
+ 578      if not layout.is_block_outermost:
+ 579          # Each layer's block stride is its own padded page.
+ 580          return max(
+ 581              sum(
+ 582                  _get_layer_block_stride(_get_per_layer_spec(group, layer_name))
+ 583                  for layer_name in group.layer_names
+ 584              )
+ 585              for group in kv_cache_groups
+ 586          )
+ 587      bytes_per_block = max(
+ 588          sum(
+ 589              _get_per_layer_spec(group, layer_name).page_size_bytes
+ 590              for layer_name in group.layer_names
+ 591          )
+ 592          for group in kv_cache_groups
+ 593      )
+ 594      assert bytes_per_block &gt; 0
+ 595      alignments = [
+ 596          group.kv_cache_spec.page_size_bytes
+ 597          for group in kv_cache_groups
+ 598          if isinstance(group.kv_cache_spec, HiSparseHotSpec)
+ 599      ]
+ 600      alignments.extend(
+ 601          _get_per_layer_spec(group, layer_name).get_block_stride_alignment()
+ 602          for group in kv_cache_groups
+ 603          for layer_name in group.layer_names
+ 604      )
+ 605      return round_up(bytes_per_block, math.lcm(*alignments))</code></pre></details></details>
+<p>因而有三种不同数字：两个 group 的 view 可以共同引用 4096 bytes backing；请求占用六个 ID，对池的容量占用是 <code>6 × 512 = 3072 bytes</code>；这些 ID 中各层页的大小合计是 <code>3 × 512 + 3 × 384 = 2688 bytes</code>。两者相差的 384 bytes 来自 G1 的三份组间空隙，尚未扣除 token 尾块等有效数据差额。把每个描述里的 <code>size=4096</code> 相加，会把同一 backing 重复计算。</p><p>这个例子只说明已经确定的两组怎样摆放，不声称默认 builder 必然将某个模型分成这两组。特殊 host pool、HiSparse、平台自定义分配器和跨层共享还需要单独核查；这里描述的是引用源码中的默认设备 backing 路径。</p></section>
+<section id="layout-checklist"><h2>6. 把四种“大小”放回各自位置</h2><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>要问的问题</th><th>应该查看的对象</th></tr></thead><tbody><tr><td>一个管理 block 覆盖多少原始 token？</td><td>spec 的 block_size，以及压缩 / 并行语义</td></tr><tr><td>某层的一页占多少字节？</td><td>page_size_bytes、状态 shape、dtype、padding</td></tr><tr><td>一个池 ID 在设备上占多少容量？</td><td>builder 的 pool bytes per block，不能只看某层页大小</td></tr><tr><td>kernel 如何读这一页？</td><td>layout、tensor stride、kernel block size 和 backend 的 view</td></tr></tbody></table></div><p>管理 block 与 kernel block 还可能不同。例如一个 16-token 管理 block 被 backend 虚拟拆成两个 8-token kernel block时，kernel 表和索引需要适配，不能直接把管理 ID 当成 kernel ID。具体拆分能力由 backend 决定。下一章将用确定下来的 page 与 pool stride，把内存预算转换成实际缓存池。</p><details class="source" id="src-m-kernel-block"><summary><span>源码证据</span>管理 block 与 kernel block 的适配入口<small>vllm · 2f1041e8dd · L631–650</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/utils.py#L631-L650" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/utils.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 631      kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+ 632  ) -&gt; list[int]:
+ 633      &quot;&quot;&quot;Generate kernel_block_sizes that matches each block_size.
+ 634
+ 635      For attention backends that support virtual block splitting,
+<span class="code-comment">      # [讲解补充] 只有支持虚拟拆分的 backend 才会选择不同的 kernel block size。</span>
+ 636      use the supported block sizes from the backend.
+ 637      For other backends (like Mamba), use the same block size (no splitting).
+ 638
+ 639      Args:
+ 640          kv_cache_config: The KV cache configuration.
+ 641          attn_groups: Attention groups indexed by KV cache group id.
+ 642
+ 643      Returns:
+ 644          List of kernel block sizes for each cache group.
+ 645
+ 646      &quot;&quot;&quot;
+ 647      kernel_block_sizes = []
+ 648      for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+ 649          kv_cache_spec = kv_cache_group.kv_cache_spec
+ 650          if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 631      kv_cache_config: KVCacheConfig, attn_groups: list[list[AttentionGroup]]
+ 632  ) -&gt; list[int]:
+ 633      &quot;&quot;&quot;Generate kernel_block_sizes that matches each block_size.
+ 634
+ 635      For attention backends that support virtual block splitting,
+ 636      use the supported block sizes from the backend.
+ 637      For other backends (like Mamba), use the same block size (no splitting).
+ 638
+ 639      Args:
+ 640          kv_cache_config: The KV cache configuration.
+ 641          attn_groups: Attention groups indexed by KV cache group id.
+ 642
+ 643      Returns:
+ 644          List of kernel block sizes for each cache group.
+ 645
+ 646      &quot;&quot;&quot;
+ 647      kernel_block_sizes = []
+ 648      for kv_cache_gid, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+ 649          kv_cache_spec = kv_cache_group.kv_cache_spec
+ 650          if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):</code></pre></details></details></section>
+<footer><a href="kv-model-path.html">← 第 3 章：从模型配置找到真实实现</a> · <a href="kv-initialization.html">第 5 章：启动时怎样建立缓存池 →</a><p><a href="kv-outline.html">KV Cache 完整目录</a> · <a href="THIRD_PARTY_NOTICES.txt">源码归属与许可</a> · <a href="articles.html">原文章索引</a></p></footer></main></div><script src="assets/book/reader.js"></script></body></html>

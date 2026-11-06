@@ -1,0 +1,542 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="跟踪前缀身份、共享引用、淘汰与抢占，再解释滑窗和递归状态的恢复条件。"><title>复用、回收与恢复｜推理系统源码读本</title><link rel="stylesheet" href="assets/book/styles.css"></head><body><a class="skip" href="#main">跳到正文</a><div id="progress"></div><button id="menu" aria-label="打开目录" aria-expanded="false">☰ 目录</button><aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">kv<span>·</span></span><strong>推理系统源码读本<small>vLLM × vLLM-Ascend</small></strong></a><div class="topic-label">专题导航</div><nav class="topic-nav" aria-label="全站专题"><a href="index.html" >总览 · 推理系统源码读本</a><a href="kv-outline.html" class="selected-topic">KV Cache 管理<small>已写 7 章</small></a><a href="index.html#pd" >P/D 分离<small>规划</small></a><a href="index.html#pool" >KV Pool 池化<small>规划</small></a><a href="index.html#cp" >PCP / DCP<small>规划</small></a><a href="courses/model-runner/index.html" >Model Runner<small>已有</small></a></nav><p class="community-link"><a href="contributing.html">共建说明：要求、计划与接续方法 →</a></p><div class="book-label">KV CACHE 管理 / 第 07 章</div><div class="current-chapter"><strong>复用、回收与恢复</strong></div><nav aria-label="本章目录"><a href="#prefix-key">1. Prefix caching 比较的是什么？</a><a href="#reference-example">2. 两个请求共享前缀时，ref_cnt 怎样变化？</a><a href="#free-evict">3. 释放引用、保留缓存和淘汰是三个动作</a><a href="#hit-boundary">4. 为什么全 prompt 命中，还可能要重算？</a><a href="#preemption">5. 抢占后恢复：保留 token 序列，重新建立执行状态</a><a href="#window">6. 滑窗回收：丢掉表中的引用，保留逻辑位置</a><a href="#state-restore">7. 递归状态恢复：要的是正确边界的状态</a><a href="#lifecycle-summary">8. 用三本账检查一次回收</a></nav><details class="book-outline"><summary>本专题大纲 <span>16 章</span></summary><p><a href="kv-outline.html">查看完整目录与模型案例 →</a></p><ol><li><span>01</span><a href="kv-cache.html">谁在管理 KV Cache？</a><small>已编写</small></li><li><span>02</span><a href="kv-attention.html">Attention 结构决定缓存什么</a><small>已编写</small></li><li><span>03</span><a href="kv-model-path.html">从模型配置找到真实实现</a><small>已编写</small></li><li><span>04</span><a href="kv-layout.html">Cache spec、group 与物理布局</a><small>已编写</small></li><li><span>05</span><a href="kv-initialization.html">启动时怎样建立缓存池</a><small>已编写</small></li><li><span>06</span><a href="kv-request-step.html">一轮请求怎样分配、写入和读取</a><small>已编写</small></li><li><span>07</span><a href="kv-reuse.html" aria-current="page">复用、回收与恢复</a><small>本章</small></li><li><span>08</span><a href="kv-outline.html#chapter-08">普通 GQA 模型：完整基线案例</a><small>待写</small></li><li><span>09</span><a href="kv-outline.html#chapter-09">Qwen3.5 / Qwen3.6：Full Attention + GDN</a><small>待写</small></li><li><span>10</span><a href="kv-outline.html#chapter-10">Kimi K3：MLA + KDA</a><small>待写</small></li><li><span>11</span><a href="kv-outline.html#chapter-11">DeepSeek V4：压缩与多类缓存</a><small>待写</small></li><li><span>12</span><a href="kv-outline.html#chapter-12">GLM-5.3：稀疏 Attention 缓存链路</a><small>待写</small></li><li><span>13</span><a href="kv-outline.html#chapter-13">GLM-5.3-Flash：混合 Attention 与辅助状态</a><small>待写</small></li><li><span>14</span><a href="kv-outline.html#chapter-14">同一个请求，在不同模型里会发生什么？</a><small>待写</small></li><li><span>15</span><a href="kv-outline.html#chapter-15">如何算准一个真实模型的缓存容量？</a><small>待写</small></li><li><span>16</span><a href="kv-outline.html#chapter-16">接到系统专题：并行、传输与池化</a><small>待写</small></li></ol></details></aside><div class="page"><header class="topbar"><span><a href="index.html">专题总览</a> / <a href="kv-outline.html">KV Cache 目录</a></span><button id="reading" aria-pressed="false">宽屏阅读</button></header><main id="main"><div class="eyebrow">CHAPTER 07<span>源码 · 例子 · 计算过程</span></div><h1>复用、回收与恢复</h1><p class="dek">跟踪前缀身份、共享引用、淘汰与抢占，再解释滑窗和递归状态的恢复条件。</p><div class="version"><b>源码基线 / 2026.10.25</b><span>vLLM 2f1041e8dd · Ascend e07bf18b76</span><span>章节更新 / 2026.11.06</span></div><div class="intro"><p>分配后，block 不只有“正在使用”和“已删除”两种状态。一个请求结束，页中的旧 KV 可能仍在，也可能仍可按前缀命中；一个页的引用计数降到 0，只表示它可以成为复用或淘汰候选，不等于设备内容已清零。本章从普通 Full Attention 的共享前缀开始，再讨论抢占、滑窗与递归状态的恢复边界。</p><p>基线仍为本书固定提交。数值例子采用单 rank、<code>B=4</code>、两层普通 GQA、每层页 256 bytes，开启本地 prefix caching；关闭 CP、投机解码、外部 KV 传输。凡讨论异步执行、滑窗或状态型缓存，会另行注明条件。</p></div>
+<section id="prefix-key"><h2>1. Prefix caching 比较的是什么？</h2><p>普通 causal attention 中，同一位置的 K/V 依赖此前的输入上下文。因此，仅比较当前四个 token 是否相同不够。例如两条请求的某个 block 都是同样的四个 token，但更早的 prefix 不同，不能据此共享这个 block 的 K/V。</p><p><code>hash_block_tokens()</code> 将父 block 的 hash、当前 block token IDs 和额外键一起放入 hash 输入。父 hash 把更早的 prefix 串入当前身份；额外键用于表达实现中需要区分的其他条件。模型服务里的 LoRA、多模态输入和缓存隔离等因素，应该追对应 extra keys 的产生位置，不能假设文本相同必然命中。</p><details class="source" id="src-m-prefix-hash"><summary><span>源码证据</span>Block hash 包含前缀身份、当前 token 与额外键<small>vllm · 2f1041e8dd · L707–737</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_utils.py#L707-L737" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/kv_cache_utils.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 707  def hash_block_tokens(
+ 708      hash_function: Callable[[Any], bytes],
+ 709      parent_block_hash: BlockHash | None,
+ 710      curr_block_token_ids: Sequence[int],
+ 711      extra_keys: tuple[Any, ...] | None = None,
+ 712  ) -&gt; BlockHash:
+ 713      &quot;&quot;&quot;Computes a hash value corresponding to the contents of a block and
+ 714      the contents of the preceding block(s). The hash value is used for
+ 715      prefix caching. We use LRU cache for this function to avoid recomputing
+ 716      hash values for the same block contents.
+ 717
+ 718      Args:
+ 719          hash_function: The hash function used to compute block hash.
+ 720          parent_block_hash: The hash of the parent block. None
+ 721              if this is the first block.
+ 722          curr_block_token_ids: A list of token ids in the current
+ 723              block. The current block is assumed to be full.
+ 724          extra_keys: Extra keys for the block.
+ 725
+ 726      Returns:
+ 727          The hash value of the block and the token ids in the block.
+ 728          The entire tuple is used as the hash key of the block.
+ 729
+ 730      &quot;&quot;&quot;
+ 731      if not parent_block_hash:
+ 732          parent_block_hash = NONE_HASH
+ 733
+ 734      curr_block_token_ids_tuple = tuple(curr_block_token_ids)
+<span class="code-comment">      # [讲解补充] 父 hash 把更早上下文带入身份；相同局部 token 不足以说明缓存相同。</span>
+ 735      return BlockHash(
+ 736          hash_function((parent_block_hash, curr_block_token_ids_tuple, extra_keys))
+ 737      )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 707  def hash_block_tokens(
+ 708      hash_function: Callable[[Any], bytes],
+ 709      parent_block_hash: BlockHash | None,
+ 710      curr_block_token_ids: Sequence[int],
+ 711      extra_keys: tuple[Any, ...] | None = None,
+ 712  ) -&gt; BlockHash:
+ 713      &quot;&quot;&quot;Computes a hash value corresponding to the contents of a block and
+ 714      the contents of the preceding block(s). The hash value is used for
+ 715      prefix caching. We use LRU cache for this function to avoid recomputing
+ 716      hash values for the same block contents.
+ 717
+ 718      Args:
+ 719          hash_function: The hash function used to compute block hash.
+ 720          parent_block_hash: The hash of the parent block. None
+ 721              if this is the first block.
+ 722          curr_block_token_ids: A list of token ids in the current
+ 723              block. The current block is assumed to be full.
+ 724          extra_keys: Extra keys for the block.
+ 725
+ 726      Returns:
+ 727          The hash value of the block and the token ids in the block.
+ 728          The entire tuple is used as the hash key of the block.
+ 729
+ 730      &quot;&quot;&quot;
+ 731      if not parent_block_hash:
+ 732          parent_block_hash = NONE_HASH
+ 733
+ 734      curr_block_token_ids_tuple = tuple(curr_block_token_ids)
+ 735      return BlockHash(
+ 736          hash_function((parent_block_hash, curr_block_token_ids_tuple, extra_keys))
+ 737      )</code></pre></details></details>
+<p>BlockPool 查找时还组合 cache group ID：同一串 token 对不同 group 的缓存内容不一样。请求 A 在 G0 的页不能因 token hash 相同，就被误认作 G1 所需的状态。命中返回的是已经存在的物理 block 引用，本地普通命中本身不需要复制整页 KV。</p><details class="source" id="src-m-prefix-group"><summary><span>源码证据</span>按 block hash 和 group ID 查找物理块<small>vllm · 2f1041e8dd · L213–224</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/block_pool.py#L213-L224" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/block_pool.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 213          cached_blocks = []
+<span class="code-comment">      # [讲解补充] 同一 token 前缀在不同 group 中不是同一份缓存。</span>
+ 214          for group_id in kv_cache_group_ids:
+ 215              block_hash_with_group_id = make_block_hash_with_group_id(
+ 216                  block_hash, group_id
+ 217              )
+ 218              block = self.cached_block_hash_to_block.get_one_block(
+ 219                  block_hash_with_group_id
+ 220              )
+ 221              if not block:
+ 222                  return None
+ 223              cached_blocks.append(block)
+ 224          return cached_blocks</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 213          cached_blocks = []
+ 214          for group_id in kv_cache_group_ids:
+ 215              block_hash_with_group_id = make_block_hash_with_group_id(
+ 216                  block_hash, group_id
+ 217              )
+ 218              block = self.cached_block_hash_to_block.get_one_block(
+ 219                  block_hash_with_group_id
+ 220              )
+ 221              if not block:
+ 222                  return None
+ 223              cached_blocks.append(block)
+ 224          return cached_blocks</code></pre></details></details>
+<p>对于普通 Full Attention 的基础路径，按完整 block 复用最容易理解。但这个版本还有 partial block、细粒度 hash 和稀疏状态保留相关逻辑；“所有缓存永远只保存整块”不是本章要推广的结论。本例只使用完整前缀块，不分析那些特殊路径。</p></section>
+<section id="reference-example"><h2>2. 两个请求共享前缀时，ref_cnt 怎样变化？</h2><p>假设 A 已完成 10 个 token，表为 <code>[5,2,7]</code>。前八个 token 覆盖两个完整 block，ID 5、2 已登记可命中的前缀；ID 7 是 A 的尾块。随后 B 的前八个 token 与 A 相同，后两个不同。B 采用前缀命中后，只为自己的尾部申请 ID 3，表为 <code>[5,2,3]</code>。</p><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>时刻</th><th>ID 5 的 ref_cnt</th><th>ID 2 的 ref_cnt</th><th>尾页情况</th></tr></thead><tbody><tr><td>只有 A 使用</td><td>1</td><td>1</td><td>7 属于 A</td></tr><tr><td>B 采用命中并持有前缀</td><td>2</td><td>2</td><td>7 属于 A，3 属于 B</td></tr><tr><td>A 安全释放后</td><td>1</td><td>1</td><td>7 可回收；3 仍属 B</td></tr><tr><td>B 也安全释放后</td><td>0</td><td>0</td><td>前缀页进入可淘汰队列，hash 可能保留</td></tr></tbody></table></div><p><code>touch()</code> 会增加引用计数；如果命中的页此前 ref_cnt 为 0，还会从空闲队列取下它。这里的引用计数是 manager 的 block 引用关系，不是 PyTorch tensor 的 Python 引用计数，也不是“有多少层使用这个 ID”。两层同组时，同一请求持有这组的 block，不因层数为 2 就自动把 ref_cnt 加成 2。</p><details class="source" id="src-m-touch"><summary><span>源码证据</span>采用命中时增加引用，并检查可写条件<small>vllm · 2f1041e8dd · L752–774</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/block_pool.py#L752-L774" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/block_pool.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 752      def touch(self, blocks: Sequence[KVCacheBlock]) -&gt; None:
+ 753          &quot;&quot;&quot;Touch a block increases its reference count by 1, and may remove
+ 754          the block from the free queue. This is used when a block is hit by
+ 755          another request with the same prefix.
+ 756
+ 757          Args:
+ 758              blocks: A list of blocks to touch.
+ 759
+ 760          &quot;&quot;&quot;
+ 761          for block in blocks:
+ 762              if block.is_null:
+ 763                  continue
+ 764              # ref_cnt=0 means this block is in the free list (i.e. eviction
+ 765              # candidate), so remove it.
+<span class="code-comment">      # [讲解补充] 零引用页可能仍有可命中的旧缓存；采用它时先从空闲队列拿走。</span>
+ 766              if block.ref_cnt == 0:
+ 767                  self.free_block_queue.remove(block)
+ 768              block.ref_cnt += 1
+ 769              if self.metrics_collector:
+ 770                  self.metrics_collector.on_block_accessed(block)
+ 771
+<span class="code-comment">      # [讲解补充] 可原地写入还要求没有缓存 hash，不能只看是否独占。</span>
+ 772      def is_block_writable(self, block: KVCacheBlock) -&gt; bool:
+ 773          &quot;&quot;&quot;Return whether a block can be mutated by its sole owner.&quot;&quot;&quot;
+ 774          return not block.is_null and block.ref_cnt == 1 and block.block_hash is None</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 752      def touch(self, blocks: Sequence[KVCacheBlock]) -&gt; None:
+ 753          &quot;&quot;&quot;Touch a block increases its reference count by 1, and may remove
+ 754          the block from the free queue. This is used when a block is hit by
+ 755          another request with the same prefix.
+ 756
+ 757          Args:
+ 758              blocks: A list of blocks to touch.
+ 759
+ 760          &quot;&quot;&quot;
+ 761          for block in blocks:
+ 762              if block.is_null:
+ 763                  continue
+ 764              # ref_cnt=0 means this block is in the free list (i.e. eviction
+ 765              # candidate), so remove it.
+ 766              if block.ref_cnt == 0:
+ 767                  self.free_block_queue.remove(block)
+ 768              block.ref_cnt += 1
+ 769              if self.metrics_collector:
+ 770                  self.metrics_collector.on_block_accessed(block)
+ 771
+ 772      def is_block_writable(self, block: KVCacheBlock) -&gt; bool:
+ 773          &quot;&quot;&quot;Return whether a block can be mutated by its sole owner.&quot;&quot;&quot;
+ 774          return not block.is_null and block.ref_cnt == 1 and block.block_hash is None</code></pre></details></details>
+<p>两条请求的分配容量分别是 <code>3×512=1536 bytes</code>，逐请求相加得到 3072 bytes；但唯一被请求持有的 ID 只有 <code>{5,2,7,3}</code> 四个，实际占用池容量是 <code>4×512=2048 bytes</code>。共享的 1024 bytes 被两条请求各自账本计入过一次。这里 512 是该组两层的页总大小，池的整个 backing 仍保持 4096 bytes。</p></section>
+<section id="free-evict"><h2>3. 释放引用、保留缓存和淘汰是三个动作</h2><p><code>free_blocks()</code> 先减引用。只有减到 0 的普通页才进入可复用队列；仍被 B 引用的页不能因为 A 结束就被另一个请求覆盖。带缓存 hash 的页与没有 hash 的页，插入队列的策略也不同：这个版本让无缓存页优先复用，让缓存页按相应的 FIFO 队列行为保留复用机会。</p><details class="source" id="src-m-free"><summary><span>源码证据</span>释放引用后按缓存身份进入不同队列位置<small>vllm · 2f1041e8dd · L785–808</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/block_pool.py#L785-L808" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/block_pool.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 785          # Identify blocks with hash (LRU cache) and without it (never match APC)
+ 786          blocks_to_evict_last = []
+ 787          blocks_to_evict_first = []
+ 788          other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
+ 789          for block in ordered_blocks:
+ 790              if block.is_null:  # never pooled; its ref_cnt is not maintained
+ 791                  continue
+ 792              if block.pool is not None and block.pool is not self:
+ 793                  other_pools.setdefault(block.pool, []).append(block)
+ 794                  continue
+<span class="code-comment">      # [讲解补充] 减的是请求对 block 的引用，不是释放整个设备 backing。</span>
+ 795              block.ref_cnt -= 1
+ 796              if block.ref_cnt == 0:
+<span class="code-comment">      # [讲解补充] 无缓存 hash 的页优先复用；有 hash 的页保留再次命中的机会。</span>
+ 797                  if block.block_hash is None or not self.enable_caching:
+ 798                      # LIFO reuse of non-cached blocks for better GPU locality.
+ 799                      blocks_to_evict_first.append(block)
+ 800                  else:
+ 801                      # FIFO reuse of cached blocks for LRU eviction behavior.
+ 802                      blocks_to_evict_last.append(block)
+ 803
+ 804          # Blocks to reuse first are prepended to the front of the free queue.
+ 805          self.free_block_queue.prepend_n(blocks_to_evict_first)
+ 806          # Blocks to reuse last are appended to the end of the free queue.
+ 807          self.free_block_queue.append_n(blocks_to_evict_last)
+ 808          for pool, blocks in other_pools.items():</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 785          # Identify blocks with hash (LRU cache) and without it (never match APC)
+ 786          blocks_to_evict_last = []
+ 787          blocks_to_evict_first = []
+ 788          other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
+ 789          for block in ordered_blocks:
+ 790              if block.is_null:  # never pooled; its ref_cnt is not maintained
+ 791                  continue
+ 792              if block.pool is not None and block.pool is not self:
+ 793                  other_pools.setdefault(block.pool, []).append(block)
+ 794                  continue
+ 795              block.ref_cnt -= 1
+ 796              if block.ref_cnt == 0:
+ 797                  if block.block_hash is None or not self.enable_caching:
+ 798                      # LIFO reuse of non-cached blocks for better GPU locality.
+ 799                      blocks_to_evict_first.append(block)
+ 800                  else:
+ 801                      # FIFO reuse of cached blocks for LRU eviction behavior.
+ 802                      blocks_to_evict_last.append(block)
+ 803
+ 804          # Blocks to reuse first are prepended to the front of the free queue.
+ 805          self.free_block_queue.prepend_n(blocks_to_evict_first)
+ 806          # Blocks to reuse last are appended to the end of the free queue.
+ 807          self.free_block_queue.append_n(blocks_to_evict_last)
+ 808          for pool, blocks in other_pools.items():</code></pre></details></details>
+<p>此时 ref_cnt=0、hash 尚在的页，既是“可命中的旧缓存”，也是“可分配时淘汰的候选”。两种身份并不矛盾。若新请求 C 在它被覆盖前命中，touch 会把它从空闲队列拿走并重新引用；若分配器先选中它交给别的内容，<code>get_new_blocks()</code> 会撤销旧缓存映射，再把引用计数变为 1。</p><details class="source" id="src-m-reallocate"><summary><span>源码证据</span>重新分配时撤销旧缓存映射<small>vllm · 2f1041e8dd · L678–700</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/block_pool.py#L678-L700" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/block_pool.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 678          if num_blocks &gt; self.get_num_free_blocks():
+ 679              raise ValueError(f&quot;Cannot get {num_blocks} free blocks from the pool&quot;)
+ 680
+ 681          ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+ 682
+ 683          if self._reuse_watchers:
+ 684              self._notify_reuse(ret)
+ 685
+ 686          # In order to only iterate the list once, we duplicated code a bit
+ 687          if self.enable_caching:
+ 688              for block in ret:
+<span class="code-comment">      # [讲解补充] 准备让页承载新内容前，必须撤销旧 hash 对这页的识别。</span>
+ 689                  self._maybe_evict_cached_block(block)
+ 690                  assert block.ref_cnt == 0
+ 691                  block.ref_cnt += 1
+ 692                  if self.metrics_collector:
+ 693                      self.metrics_collector.on_block_allocated(block)
+ 694          else:
+ 695              for block in ret:
+ 696                  assert block.ref_cnt == 0
+ 697                  block.ref_cnt += 1
+ 698                  if self.metrics_collector:
+ 699                      self.metrics_collector.on_block_allocated(block)
+ 700          return ret</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 678          if num_blocks &gt; self.get_num_free_blocks():
+ 679              raise ValueError(f&quot;Cannot get {num_blocks} free blocks from the pool&quot;)
+ 680
+ 681          ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+ 682
+ 683          if self._reuse_watchers:
+ 684              self._notify_reuse(ret)
+ 685
+ 686          # In order to only iterate the list once, we duplicated code a bit
+ 687          if self.enable_caching:
+ 688              for block in ret:
+ 689                  self._maybe_evict_cached_block(block)
+ 690                  assert block.ref_cnt == 0
+ 691                  block.ref_cnt += 1
+ 692                  if self.metrics_collector:
+ 693                      self.metrics_collector.on_block_allocated(block)
+ 694          else:
+ 695              for block in ret:
+ 696                  assert block.ref_cnt == 0
+ 697                  block.ref_cnt += 1
+ 698                  if self.metrics_collector:
+ 699                      self.metrics_collector.on_block_allocated(block)
+ 700          return ret</code></pre></details></details>
+<p>这些元数据动作通常不需要释放底层整个 tensor。旧数值可能一直留在设备字节中，直到新写入覆盖。某些执行路径需要清零新页来防止旧 NaN 或状态残留影响 kernel，runner 会按调度输出处理；所以“释放一定清零”和“从不清零”都不准确。正确性依赖有效长度、mask、写入范围和状态初始化共同保证。</p><p>源码还把可写页限定为非 null、独占且没有缓存 hash 的页。共享或已缓存状态不能随意原地修改。涉及可变状态恢复或尾部续写时，需要检查对应路径是否分配私有页、进行复制或限制命中位置，而不是只看到 ref_cnt=1 就判定可以改写。</p></section>
+<section id="hit-boundary"><h2>4. 为什么全 prompt 命中，还可能要重算？</h2><p>缓存保存的是 KV 等状态，不是本次生成所需的所有最终 logits。普通生成路径需要最后一个输入 token 的输出，因此 <code>get_computed_blocks()</code> 默认把最大命中长度限制为 <code>request.num_tokens−1</code>。在本例按整块命中且 <code>B=4</code> 的条件下：</p><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>新请求 prompt 长度</th><th>允许的最大命中 token 数</th><th>本例完整块命中长度</th><th>还要执行的输入位置</th></tr></thead><tbody><tr><td>10，前八个已有缓存</td><td>9</td><td>8</td><td>8、9</td></tr><tr><td>8，八个全都有缓存</td><td>7</td><td>4</td><td>4、5、6、7</td></tr></tbody></table></div><p>第二行看起来只差一个 token，却因整块对齐而重算一整块。它不是所有配置下都必须重算四个 token：hash 粒度、命中对齐、模型类型和具体恢复路径可以改变结果。这里严格对应所引用函数的默认限制和本例完整块假设。</p><details class="source" id="src-m-hit-limit"><summary><span>源码证据</span>默认保留最后一个输入 token 的计算<small>vllm · 2f1041e8dd · L294–306</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_manager.py#L294-L306" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/kv_cache_manager.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 294          # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+ 295          # This can trigger recomputation of an entire block, rather than just
+ 296          # the single last token, because allocate_slots() requires
+ 297          # num_computed_tokens to be block-size aligned. Removing this limitation
+ 298          # could slightly improve performance in the future.
+ 299          if max_cache_hit_length is None:
+<span class="code-comment">      # [讲解补充] 默认上界是 num_tokens−1；后续仍受命中粒度和对齐约束。</span>
+ 300              max_cache_hit_length = request.num_tokens - 1
+ 301          computed_blocks, num_new_computed_tokens, num_uncached = (
+ 302              self.coordinator.find_longest_cache_hit(
+ 303                  request.block_hashes, max_cache_hit_length
+ 304              )
+ 305          )
+ 306  </code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 294          # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+ 295          # This can trigger recomputation of an entire block, rather than just
+ 296          # the single last token, because allocate_slots() requires
+ 297          # num_computed_tokens to be block-size aligned. Removing this limitation
+ 298          # could slightly improve performance in the future.
+ 299          if max_cache_hit_length is None:
+ 300              max_cache_hit_length = request.num_tokens - 1
+ 301          computed_blocks, num_new_computed_tokens, num_uncached = (
+ 302              self.coordinator.find_longest_cache_hit(
+ 303                  request.block_hashes, max_cache_hit_length
+ 304              )
+ 305          )
+ 306  </code></pre></details></details>
+<p>混合模型还要找到所有必要 group 能共同恢复的位置。不能只拿 Full Attention 命中的最长前缀作为整个模型的命中长度：若同一位置的 recurrent checkpoint 不存在，后续层就没有正确的起始状态。协调器负责各 manager 的命中协商；需要区分“某组有缓存”和“整个模型能从这里继续”。</p></section>
+<section id="preemption"><h2>5. 抢占后恢复：保留 token 序列，重新建立执行状态</h2><p>当空闲 block 不足时，scheduler 可能把某个运行请求抢占，放回等待队列。引用源码中的 <code>_preempt_request()</code> 会释放或安排释放请求块，清理相关状态，把状态改为 <code>PREEMPTED</code>，并将 <code>num_computed_tokens</code> 重置为 0。</p><details class="source" id="src-m-preempt"><summary><span>源码证据</span>抢占重置运行状态与计算进度<small>vllm · 2f1041e8dd · L1757–1770</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/sched/scheduler.py#L1757-L1770" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/sched/scheduler.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1757          assert request.status == RequestStatus.RUNNING, (
+1758              &quot;Only running requests can be preempted&quot;
+1759          )
+1760          if self.aux_output_connector is not None:
+1761              self.aux_output_connector.request_finished(request)
+<span class="code-comment">      # [讲解补充] 释放可能是延迟归还，取决于是否仍有设备操作在途。</span>
+1762          self._free_request_blocks(request)
+1763          self.encoder_cache_manager.free(request)
+1764          self._inflight_prefills.discard(request)
+1765          request.status = RequestStatus.PREEMPTED
+<span class="code-comment">      # [讲解补充] 恢复时重新建立计算前缀；请求 token 序列并未在这里删除。</span>
+1766          request.num_computed_tokens = 0
+1767          if request.spec_token_ids:
+1768              request.spec_token_ids = []
+1769          # Async scheduling: mark all in-flight output as stale. Its tokens are
+1770          # still delivered on return (dropping them would perturb spec-decode</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1757          assert request.status == RequestStatus.RUNNING, (
+1758              &quot;Only running requests can be preempted&quot;
+1759          )
+1760          if self.aux_output_connector is not None:
+1761              self.aux_output_connector.request_finished(request)
+1762          self._free_request_blocks(request)
+1763          self.encoder_cache_manager.free(request)
+1764          self._inflight_prefills.discard(request)
+1765          request.status = RequestStatus.PREEMPTED
+1766          request.num_computed_tokens = 0
+1767          if request.spec_token_ids:
+1768              request.spec_token_ids = []
+1769          # Async scheduling: mark all in-flight output as stale. Its tokens are
+1770          # still delivered on return (dropping them would perturb spec-decode</code></pre></details></details>
+<p>重置计算进度不等于把用户 prompt 和已经接受的输出 token 忘掉。恢复时仍有请求的 token 序列可以重算；如果旧页保留且 prefix caching 条件允许，也可能重新命中部分前缀。不要把该基础路径描述成“暂停时自动把全部 KV 搬到 CPU，再原样搬回”：offload 或外部 connector 的行为要另看其实现。</p><p>例如 A 已处理到位置 10，抢占前有三个逻辑 block。若恢复时还能命中前八个 token，就可从命中边界后重放剩余输入；若前缀已被淘汰，则要从更早处计算。重新分配的物理 ID 可以与旧表不同，但对相同 token 序列和模型而言，重算的目标仍是恢复正确的逻辑状态。</p><p>异步执行中还有一个时间边界：请求从 running 移走时，旧 kernel 可能仍在访问页。<code>_free_request_blocks()</code> 会检查是否可以安全归还，不可以时把 block 放进 deferred frees，等相应 fence 步骤完成才回池。否则新请求已经写入，旧 kernel 又回来覆盖同一个 ID，就会破坏数据。</p><details class="source" id="src-m-deferred"><summary><span>源码证据</span>在途执行结束前延迟归还物理块<small>vllm · 2f1041e8dd · L2952–2961</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/sched/scheduler.py#L2952-L2961" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/sched/scheduler.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>2952      def _free_request_blocks(self, request: Request):
+2953          &quot;&quot;&quot;Free the request's KV blocks, deferring the return to the block
+2954          pool when an in-flight GPU step may still write them.
+2955          &quot;&quot;&quot;
+<span class="code-comment">      # [讲解补充] 能安全释放时直接归还；否则将 block 保存到延迟队列。</span>
+2956          if self._request_blocks_can_be_freed(request):
+2957              self.kv_cache_manager.free(request)
+2958              return
+2959          blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+2960          if blocks:
+2961              self.deferred_frees.append((self.sched_step_seq, blocks))</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>2952      def _free_request_blocks(self, request: Request):
+2953          &quot;&quot;&quot;Free the request's KV blocks, deferring the return to the block
+2954          pool when an in-flight GPU step may still write them.
+2955          &quot;&quot;&quot;
+2956          if self._request_blocks_can_be_freed(request):
+2957              self.kv_cache_manager.free(request)
+2958              return
+2959          blocks = self.kv_cache_manager.pop_blocks_for_free(request)
+2960          if blocks:
+2961              self.deferred_frees.append((self.sched_step_seq, blocks))</code></pre></details></details></section>
+<section id="window"><h2>6. 滑窗回收：丢掉表中的引用，保留逻辑位置</h2><p>改用滑窗配置 <code>W=4</code>，仍令 <code>B=4</code>，无额外保留 token。若已经安全完成 p=0…6 共 7 个 token，下一个 query 是 p=7，它的窗口覆盖 p=4…7。按源码公式，可跳过 token 数为：</p><pre><code>skipped = max(0, computed − W + 1 − extra_retained_tokens)
+        = max(0, 7 − 4 + 1 − 0) = 4
+可回收完整块数 = floor(skipped / B) = floor(4 / 4) = 1</code></pre><details class="source" id="src-m-window"><summary><span>源码证据</span>滑窗可跳过范围包含额外保留条件<small>vllm · 2f1041e8dd · L1174–1179</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/single_type_kv_cache_manager.py#L1174-L1179" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/single_type_kv_cache_manager.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1174
+1175          &quot;&quot;&quot;
+<span class="code-comment">      # [讲解补充] 按已安全处理的前缀计算窗口；额外保留区可能推迟回收。</span>
+1176          return max(
+1177              0,
+1178              num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
+1179          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1174
+1175          &quot;&quot;&quot;
+1176          return max(
+1177              0,
+1178              num_computed_tokens - self.sliding_window + 1 - self.extra_retained_tokens,
+1179          )</code></pre></details></details>
+<p>若原表为 <code>[5,2]</code>，回收旧页 5 后，逻辑表相应位置用 null block 占位，概念上成为 <code>[0,2]</code>，不是压缩成 <code>[2]</code>。因为 p=7 的逻辑块下标仍为 <code>floor(7/4)=1</code>，它必须在下标 1 找到 ID 2；删除表项导致下标整体左移会把位置关系弄错。</p><details class="source" id="src-m-skip-free"><summary><span>源码证据</span>只回收完全离开窗口的整块<small>vllm · 2f1041e8dd · L702–718</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/single_type_kv_cache_manager.py#L702-L718" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/single_type_kv_cache_manager.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 702          &quot;&quot;&quot;
+ 703          del num_prompt_tokens
+ 704          # Remove the blocks that will be skipped during attention computation.
+ 705          num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)
+ 706          if num_skipped_tokens &lt;= 0:
+ 707              # This indicates that ALL tokens are inside attention window.
+ 708              # Thus we do not need to free any blocks outside attention window.
+ 709              # A typical case is full attention that we never free any token
+ 710              # before the request is finished.
+ 711              return
+ 712          blocks = self.req_to_blocks[request_id]
+<span class="code-comment">      # [讲解补充] 向下取整：一个块仍有需要的数据时，不能仅释放它的一部分。</span>
+ 713          num_skipped_blocks = num_skipped_tokens // self.block_size
+ 714          # `num_skipped_tokens` may include tokens that haven't been allocated yet
+ 715          # (e.g., when the attention window moves into the external computed tokens
+ 716          # range), so we must cap to the number of blocks that currently exist for
+ 717          # this request.
+ 718          num_skipped_blocks = min(num_skipped_blocks, len(blocks))</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 702          &quot;&quot;&quot;
+ 703          del num_prompt_tokens
+ 704          # Remove the blocks that will be skipped during attention computation.
+ 705          num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)
+ 706          if num_skipped_tokens &lt;= 0:
+ 707              # This indicates that ALL tokens are inside attention window.
+ 708              # Thus we do not need to free any blocks outside attention window.
+ 709              # A typical case is full attention that we never free any token
+ 710              # before the request is finished.
+ 711              return
+ 712          blocks = self.req_to_blocks[request_id]
+ 713          num_skipped_blocks = num_skipped_tokens // self.block_size
+ 714          # `num_skipped_tokens` may include tokens that haven't been allocated yet
+ 715          # (e.g., when the attention window moves into the external computed tokens
+ 716          # range), so we must cap to the number of blocks that currently exist for
+ 717          # this request.
+ 718          num_skipped_blocks = min(num_skipped_blocks, len(blocks))</code></pre></details></details>
+<p>若只完成 6 个 token，skipped 为 3，<code>floor(3/4)=0</code>，第一块仍有窗口需要的数据，不能整页归还。可见有效窗口长度只有四个 token，并不意味着始终恰好占一页。chunk 大小、块边界、额外保留区和当前在途执行都可能增加驻留页数。</p><p>这份 manager 调用使用安全处理进度，并考虑 in-flight tokens，而不是直接按乐观调度进度回收。kernel 如果按 tile 读取窗口边界之外的数据，还需要正确的表项与 mask 处理。模型层执行滑窗计算，也不一定采用滑窗分配器；若配置退化为 Full Attention 分配，旧页的回收行为就不同。</p></section>
+<section id="state-restore"><h2>7. 递归状态恢复：要的是正确边界的状态</h2><p>对 GDN/KDA 等状态型缓存，不能把第六章的“每个历史 token 都有一个独立槽位”直接搬过来。递归更新会把历史信息累积到当前状态；从第 k 个 token 后继续执行，需要与这个边界对应的 recurrent state，以及该实现所需的卷积等其他状态。只保留了末端状态，并不等于保留了任意中间位置的状态。</p><p>用一个纯教学记号表示：处理 p=0…7 后得到 <code>S₈</code>，处理到 p=9 后得到 <code>S₁₀</code>。另一请求要复用前八个 token，需要从 S₈ 及相应辅助状态开始；不能把 S₁₀ 当 S₈，因为后面两个 token 已经改变了状态。也不能继续原地写一个仍被其他请求当作 checkpoint 的 S₈。</p><p>上一章提到的状态集合若为 704 bytes，只表示一份集合的有效数值大小。若管理器还为运行状态、恢复 checkpoint 或投机状态保留额外页，应按实际保留份数与 padded page bytes 计费。<code>MambaSpec.max_memory_usage_bytes()</code> 在 align 分支和其他分支中采用不同的保留数量，具体哪一页扮演什么角色还要继续看 MambaManager 和 worker 的复制 / 更新路径。</p><details class="source" id="src-mamba"><summary><span>源码证据</span>MambaSpec 按 shape 与 dtype 计算状态容量<small>vllm · 2f1041e8dd · L1079–1128</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/kv_cache_interface.py#L1079-L1128" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/kv_cache_interface.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1079  class MambaSpec(KVCacheSpec):
+1080      shapes: tuple[tuple[int, ...], ...]
+1081      dtypes: tuple[torch.dtype, ...]
+1082      page_size_padded: int | None = None
+1083      mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
+1084      mamba_cache_mode: str = &quot;none&quot;
+1085      num_speculative_blocks: int = 0
+1086      num_prefill_checkpoint_blocks: int = 0
+1087      prefill_checkpoint_alignment: int | None = None
+1088      num_heads: int = 1
+1089      tokens_per_state: int = -1
+1090      # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+1091      # rank holds the full state (e.g. the replicated PLE conv state).
+1092      tp_replicated: bool = False
+1093
+1094      @property
+1095      def state_content_size_bytes(self) -&gt; int:
+<span class="code-comment">      # [讲解补充] 逐个状态计算元素数 × dtype 字节数，再求和；此处没有乘历史 token 数。</span>
+1096          return sum(
+1097              prod(shape) * get_dtype_size(dtype)
+1098              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1099          )
+1100
+1101      @property
+1102      def real_page_size_bytes(self) -&gt; int:
+1103          return self.state_content_size_bytes
+1104
+1105      @property
+1106      def page_size_bytes(self) -&gt; int:
+1107          page_size = sum(
+1108              prod(shape) * get_dtype_size(dtype)
+1109              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1110          )
+1111          if self.page_size_padded is not None:
+1112              assert self.page_size_padded &gt;= page_size
+1113              return self.page_size_padded
+1114          return page_size
+1115
+1116      @property
+1117      def block_table_token_alignment(self) -&gt; int | None:
+1118          return None
+1119
+1120      def max_memory_usage_bytes(self, vllm_config: VllmConfig) -&gt; int:
+1121          if vllm_config.cache_config.mamba_cache_mode == &quot;align&quot;:
+1122              return self.page_size_bytes * (
+1123                  2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+1124              )
+1125          else:
+1126              return self.page_size_bytes * (1 + self.num_speculative_blocks)
+1127
+1128      def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -&gt; int:</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1079  class MambaSpec(KVCacheSpec):
+1080      shapes: tuple[tuple[int, ...], ...]
+1081      dtypes: tuple[torch.dtype, ...]
+1082      page_size_padded: int | None = None
+1083      mamba_type: MambaAttentionBackendEnum = MambaAttentionBackendEnum.MAMBA2
+1084      mamba_cache_mode: str = &quot;none&quot;
+1085      num_speculative_blocks: int = 0
+1086      num_prefill_checkpoint_blocks: int = 0
+1087      prefill_checkpoint_alignment: int | None = None
+1088      num_heads: int = 1
+1089      tokens_per_state: int = -1
+1090      # False: the state is sharded across TP ranks (e.g. GDN). True: every TP
+1091      # rank holds the full state (e.g. the replicated PLE conv state).
+1092      tp_replicated: bool = False
+1093
+1094      @property
+1095      def state_content_size_bytes(self) -&gt; int:
+1096          return sum(
+1097              prod(shape) * get_dtype_size(dtype)
+1098              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1099          )
+1100
+1101      @property
+1102      def real_page_size_bytes(self) -&gt; int:
+1103          return self.state_content_size_bytes
+1104
+1105      @property
+1106      def page_size_bytes(self) -&gt; int:
+1107          page_size = sum(
+1108              prod(shape) * get_dtype_size(dtype)
+1109              for (shape, dtype) in zip(self.shapes, self.dtypes)
+1110          )
+1111          if self.page_size_padded is not None:
+1112              assert self.page_size_padded &gt;= page_size
+1113              return self.page_size_padded
+1114          return page_size
+1115
+1116      @property
+1117      def block_table_token_alignment(self) -&gt; int | None:
+1118          return None
+1119
+1120      def max_memory_usage_bytes(self, vllm_config: VllmConfig) -&gt; int:
+1121          if vllm_config.cache_config.mamba_cache_mode == &quot;align&quot;:
+1122              return self.page_size_bytes * (
+1123                  2 + self.num_speculative_blocks + self.num_prefill_checkpoint_blocks
+1124              )
+1125          else:
+1126              return self.page_size_bytes * (1 + self.num_speculative_blocks)
+1127
+1128      def max_num_blocks_per_req(self, vllm_config: VllmConfig, max_len: int) -&gt; int:</code></pre></details></details><details class="source" id="src-checkpoint"><summary><span>源码证据</span>Qwen GDN 按条件增加 checkpoint 声明<small>vllm · 2f1041e8dd · L739–750</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py#L739-L750" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 739      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec | None:
+ 740          spec = super().get_kv_cache_spec(vllm_config)
+<span class="code-comment">      # [讲解补充] 只有导出 checkpoint 且 spec 为 MambaSpec 时，才继续增加相关声明。</span>
+ 741          if not self._exports_checkpoints or not isinstance(spec, MambaSpec):
+ 742              return spec
+ 743          # FlashInfer emits states at one stride for the whole batch, the gcd of
+ 744          # the offsets; keeping every offset on the prefix-cache grid keeps that
+ 745          # stride a multiple of the grid, which bounds the states emitted.
+ 746          return replace(
+ 747              spec,
+ 748              num_prefill_checkpoint_blocks=1,
+ 749              prefill_checkpoint_alignment=get_mamba_prefill_checkpoint_grid(vllm_config),
+ 750          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 739      def get_kv_cache_spec(self, vllm_config: VllmConfig) -&gt; KVCacheSpec | None:
+ 740          spec = super().get_kv_cache_spec(vllm_config)
+ 741          if not self._exports_checkpoints or not isinstance(spec, MambaSpec):
+ 742              return spec
+ 743          # FlashInfer emits states at one stride for the whole batch, the gcd of
+ 744          # the offsets; keeping every offset on the prefix-cache grid keeps that
+ 745          # stride a multiple of the grid, which bounds the states emitted.
+ 746          return replace(
+ 747              spec,
+ 748              num_prefill_checkpoint_blocks=1,
+ 749              prefill_checkpoint_alignment=get_mamba_prefill_checkpoint_grid(vllm_config),
+ 750          )</code></pre></details></details>
+<p>这份源码还有两个明确限制。MambaManager 要求开启 prefix caching 时采用 <code>mamba_cache_mode='align'</code>。如果命中的末端状态是本轮其他请求刚登记的，管理器会返回超过整个池容量的需求数，让这个请求本轮不被调度。这是状态依赖限制，不是真的需要那么多显存。</p><details class="source" id="src-m-mamba-mode"><summary><span>源码证据</span>Mamba prefix caching 的模式前提<small>vllm · 2f1041e8dd · L1433–1445</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/single_type_kv_cache_manager.py#L1433-L1445" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/single_type_kv_cache_manager.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1433      def __init__(
+1434          self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
+1435      ) -&gt; None:
+1436          super().__init__(kv_cache_spec, block_pool, **kwargs)
+1437          self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+<span class="code-comment">      # [讲解补充] 开启 prefix caching 时必须核对 align 模式。</span>
+1438          assert self.mamba_cache_mode == &quot;align&quot; or not self.enable_caching, (
+1439              &quot;Mamba prefix caching requires mamba_cache_mode='align'&quot;
+1440          )
+1441          self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+1442          self.has_prefill_checkpoint_blocks = (
+1443              self.mamba_cache_mode == &quot;align&quot;
+1444              and kv_cache_spec.num_prefill_checkpoint_blocks &gt; 0
+1445          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1433      def __init__(
+1434          self, kv_cache_spec: MambaSpec, block_pool: BlockPool, **kwargs
+1435      ) -&gt; None:
+1436          super().__init__(kv_cache_spec, block_pool, **kwargs)
+1437          self.mamba_cache_mode = kv_cache_spec.mamba_cache_mode
+1438          assert self.mamba_cache_mode == &quot;align&quot; or not self.enable_caching, (
+1439              &quot;Mamba prefix caching requires mamba_cache_mode='align'&quot;
+1440          )
+1441          self.num_speculative_blocks: int = kv_cache_spec.num_speculative_blocks
+1442          self.has_prefill_checkpoint_blocks = (
+1443              self.mamba_cache_mode == &quot;align&quot;
+1444              and kv_cache_spec.num_prefill_checkpoint_blocks &gt; 0
+1445          )</code></pre></details></details><details class="source" id="src-m-mamba-step"><summary><span>源码证据</span>Mamba 的同轮状态依赖限制<small>vllm · 2f1041e8dd · L1699–1708</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/single_type_kv_cache_manager.py#L1699-L1708" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/single_type_kv_cache_manager.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1699          assert isinstance(self.kv_cache_spec, MambaSpec)
+1700          if (
+1701              len(new_computed_blocks) &gt; 0
+1702              and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
+1703          ):
+1704              # Mamba can't rely on blocks generated by other requests in the current step
+1705              # To put it in the next step, we return num_gpu_blocks + 1 so
+1706              # that kv_cache_manager will think there is no enough blocks to allocate now
+1707              # and don't schedule it in the current step.
+<span class="code-comment">      # [讲解补充] 用超出池容量的需求阻止本轮调度，并非真的申请更多内存。</span>
+1708              return self.block_pool.num_gpu_blocks + 1</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1699          assert isinstance(self.kv_cache_spec, MambaSpec)
+1700          if (
+1701              len(new_computed_blocks) &gt; 0
+1702              and new_computed_blocks[-1].block_hash in self.cached_blocks_this_step
+1703          ):
+1704              # Mamba can't rely on blocks generated by other requests in the current step
+1705              # To put it in the next step, we return num_gpu_blocks + 1 so
+1706              # that kv_cache_manager will think there is no enough blocks to allocate now
+1707              # and don't schedule it in the current step.
+1708              return self.block_pool.num_gpu_blocks + 1</code></pre></details></details><p>需要写时复制时，runner 在新页清零之后、forward 之前消费 <code>kv_cache_block_copies</code>。从共享的 S₈ 续算到私有的 S₁₀，目标页必须先具有正确的起始状态，才能执行更新。这里引用的是通用复制入口；某个模型具体是否通过它复制、复制哪些数据，还要核对 manager 生成的计划。</p><details class="source" id="src-m-state-copy"><summary><span>源码证据</span>Forward 前执行写时复制<small>vllm · 2f1041e8dd · L1292–1299</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/model_runner.py#L1292-L1299" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/gpu/model_runner.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1292          # Apply copy-on-write block copies for partial prefix-cache hits, after
+1293          # zeroing new blocks and before the forward pass reads them.
+<span class="code-comment">      # [讲解补充] 先完成复制，再让 forward 读取目标页。</span>
+1294          if scheduler_output.kv_cache_block_copies:
+1295              copy_kv_cache_blocks_inplace(
+1296                  self.kv_caches,
+1297                  self.kv_cache_config.num_blocks,
+1298                  scheduler_output.kv_cache_block_copies,
+1299              )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1292          # Apply copy-on-write block copies for partial prefix-cache hits, after
+1293          # zeroing new blocks and before the forward pass reads them.
+1294          if scheduler_output.kv_cache_block_copies:
+1295              copy_kv_cache_blocks_inplace(
+1296                  self.kv_caches,
+1297                  self.kv_cache_config.num_blocks,
+1298                  scheduler_output.kv_cache_block_copies,
+1299              )</code></pre></details></details><p>本章在共同机制层面强调恢复条件，不宣称每个 GDN/KDA 模型都支持相同 checkpoint 策略。后续模型章节会分别落实配置、checkpoint 对齐、写入时机、私有状态与共享状态的转换。判断一次命中是否可用，要同时满足身份一致、恢复边界一致、所有必需组件存在，以及数据已经可以安全读取。</p></section>
+<section id="lifecycle-summary"><h2>8. 用三本账检查一次回收</h2><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>账本</th><th>需要回答的问题</th></tr></thead><tbody><tr><td>请求逻辑账</td><td>哪些 token 已被接受、哪些已处理，下一轮从哪个位置继续？</td></tr><tr><td>block 管理账</td><td>各 group 持有哪些 ID，ref_cnt / hash / 空闲队列如何变化，有没有延迟释放？</td></tr><tr><td>设备数据账</td><td>页里实际是哪一层、哪个边界的数据，是否仍有读写在途，view 是否共享 storage？</td></tr></tbody></table></div><p>三本账对得上，才能判断“释放成功”“前缀可复用”或“请求可恢复”。仅观察某块内存仍有旧数值，不能证明它仍可用；仅观察 ref_cnt 为 0，也不能证明设备空间已经减少。本章完成了共同管理机制的主线，后面的真实模型案例会逐一补上各类 spec、状态和 backend 的具体条件。</p></section>
+<footer><a href="kv-request-step.html">← 第 6 章：一轮请求怎样分配、写入和读取</a> · <a href="kv-outline.html#chapter-08">第 8 章：普通 GQA 模型：完整基线案例（待写） →</a><p><a href="kv-outline.html">KV Cache 完整目录</a> · <a href="THIRD_PARTY_NOTICES.txt">源码归属与许可</a> · <a href="articles.html">原文章索引</a></p></footer></main></div><script src="assets/book/reader.js"></script></body></html>

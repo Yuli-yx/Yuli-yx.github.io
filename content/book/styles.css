@@ -5,3 +5,5 @@
 .chapter-entry{padding:24px 0;border-bottom:1px solid var(--line);scroll-margin-top:35px}.chapter-entry h3{margin:10px 0}.chapter-entry p{font-size:14px;color:#697563}.book-outline li a{font-size:11px;line-height:1.7}.book-outline li small{flex-shrink:0}.book-outline p{font-size:11px}.book-outline li a[aria-current="page"]{font-weight:650}
 
 .code-comment{color:#286443;font-style:normal}.annotation-note{font-size:13px;color:var(--muted)}.original-source{margin:12px 0}.original-source summary{cursor:pointer;font-size:13px}.community-link{font-size:13px;line-height:1.6;margin:18px 0}
+
+.table-scroll{max-width:100%;overflow-x:auto;margin:20px 0}.table-scroll table{margin:0;min-width:560px}.table-scroll:focus-visible{outline:2px solid var(--green);outline-offset:3px}

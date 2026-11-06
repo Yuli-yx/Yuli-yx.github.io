@@ -1,0 +1,368 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="从 worker 内存预算到 num_blocks，再追踪设备分配、层绑定与 null block。"><title>启动时怎样建立缓存池｜推理系统源码读本</title><link rel="stylesheet" href="assets/book/styles.css"></head><body><a class="skip" href="#main">跳到正文</a><div id="progress"></div><button id="menu" aria-label="打开目录" aria-expanded="false">☰ 目录</button><aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">kv<span>·</span></span><strong>推理系统源码读本<small>vLLM × vLLM-Ascend</small></strong></a><div class="topic-label">专题导航</div><nav class="topic-nav" aria-label="全站专题"><a href="index.html" >总览 · 推理系统源码读本</a><a href="kv-outline.html" class="selected-topic">KV Cache 管理<small>已写 7 章</small></a><a href="index.html#pd" >P/D 分离<small>规划</small></a><a href="index.html#pool" >KV Pool 池化<small>规划</small></a><a href="index.html#cp" >PCP / DCP<small>规划</small></a><a href="courses/model-runner/index.html" >Model Runner<small>已有</small></a></nav><p class="community-link"><a href="contributing.html">共建说明：要求、计划与接续方法 →</a></p><div class="book-label">KV CACHE 管理 / 第 05 章</div><div class="current-chapter"><strong>启动时怎样建立缓存池</strong></div><nav aria-label="本章目录"><a href="#startup-chain">1. 启动链：谁决定什么？</a><a href="#budget">2. 可用 KV 预算不等于“当前空闲显存”</a><a href="#count-blocks">3. 预算怎样变成 num_blocks？</a><a href="#allocate-view">4. 真正分配的是 backing，再建立各层 view</a><a href="#null-block">5. 管理器建立同一套 ID，并保留 null block</a><a href="#startup-audit">6. 启动后怎样检查自己的理解？</a></nav><details class="book-outline"><summary>本专题大纲 <span>16 章</span></summary><p><a href="kv-outline.html">查看完整目录与模型案例 →</a></p><ol><li><span>01</span><a href="kv-cache.html">谁在管理 KV Cache？</a><small>已编写</small></li><li><span>02</span><a href="kv-attention.html">Attention 结构决定缓存什么</a><small>已编写</small></li><li><span>03</span><a href="kv-model-path.html">从模型配置找到真实实现</a><small>已编写</small></li><li><span>04</span><a href="kv-layout.html">Cache spec、group 与物理布局</a><small>已编写</small></li><li><span>05</span><a href="kv-initialization.html" aria-current="page">启动时怎样建立缓存池</a><small>本章</small></li><li><span>06</span><a href="kv-request-step.html">一轮请求怎样分配、写入和读取</a><small>已编写</small></li><li><span>07</span><a href="kv-reuse.html">复用、回收与恢复</a><small>已编写</small></li><li><span>08</span><a href="kv-outline.html#chapter-08">普通 GQA 模型：完整基线案例</a><small>待写</small></li><li><span>09</span><a href="kv-outline.html#chapter-09">Qwen3.5 / Qwen3.6：Full Attention + GDN</a><small>待写</small></li><li><span>10</span><a href="kv-outline.html#chapter-10">Kimi K3：MLA + KDA</a><small>待写</small></li><li><span>11</span><a href="kv-outline.html#chapter-11">DeepSeek V4：压缩与多类缓存</a><small>待写</small></li><li><span>12</span><a href="kv-outline.html#chapter-12">GLM-5.3：稀疏 Attention 缓存链路</a><small>待写</small></li><li><span>13</span><a href="kv-outline.html#chapter-13">GLM-5.3-Flash：混合 Attention 与辅助状态</a><small>待写</small></li><li><span>14</span><a href="kv-outline.html#chapter-14">同一个请求，在不同模型里会发生什么？</a><small>待写</small></li><li><span>15</span><a href="kv-outline.html#chapter-15">如何算准一个真实模型的缓存容量？</a><small>待写</small></li><li><span>16</span><a href="kv-outline.html#chapter-16">接到系统专题：并行、传输与池化</a><small>待写</small></li></ol></details></aside><div class="page"><header class="topbar"><span><a href="index.html">专题总览</a> / <a href="kv-outline.html">KV Cache 目录</a></span><button id="reading" aria-pressed="false">宽屏阅读</button></header><main id="main"><div class="eyebrow">CHAPTER 05<span>源码 · 例子 · 计算过程</span></div><h1>启动时怎样建立缓存池</h1><p class="dek">从 worker 内存预算到 num_blocks，再追踪设备分配、层绑定与 null block。</p><div class="version"><b>源码基线 / 2026.10.25</b><span>vLLM 2f1041e8dd · Ascend e07bf18b76</span><span>章节更新 / 2026.11.06</span></div><div class="intro"><p>请求到来之前，设备上通常已经有一整片缓存存储。启动阶段要先回答两个问题：按模型需求，一份可分配的 block 有多大；按当前设备预算，一共能放多少份。只有规划完成，scheduler 的 block ID 与 worker 的 tensor 地址才有共同依据。</p><p>本章继续使用前三章的固定提交，以普通 decoder、单设备、无 offload、无 KV 传输和无投机解码为主线。所列容量是手算例子，不是 NPU 实测结果。模型权重、激活、通信与图执行占用仍需要留在缓存预算之外。</p></div>
+<section id="startup-chain"><h2>1. 启动链：谁决定什么？</h2><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>阶段</th><th>执行者与源码入口</th><th>产生什么</th></tr></thead><tbody><tr><td>声明需求</td><td>模型缓存模块 → worker 收集 get_kv_cache_spec</td><td>按层命名的 spec，包含 backend 定制</td></tr><tr><td>确定布局与预算</td><td>EngineCore._initialize_kv_caches → executor / workers</td><td>共同支持的 layout，各 worker 可用于 KV 的内存数</td></tr><tr><td>规划分配</td><td>get_kv_cache_configs → 平台 builder</td><td>各 worker 的 group、num_blocks、tensor placement</td></tr><tr><td>建立设备缓存</td><td>initialize_from_config → runner.initialize_kv_cache</td><td>backing、逐层 view、Attention 绑定</td></tr><tr><td>建立管理对象</td><td>scheduler 的 KVCacheManager → coordinator / BlockPool</td><td>请求到 block 的记录、空闲队列、hash 索引</td></tr></tbody></table></div><p>EngineCore 调 executor，executor 才把任务分发给 worker。这里不是由 scheduler 在收到每个请求时调用 <code>torch.zeros</code> 创建新的整份 K/V。scheduler 后续主要分配已建池中的 ID；worker 用这些 ID 访问此前建立的存储。</p><details class="source" id="src-m-engine-budget"><summary><span>源码证据</span>Engine 收集 worker 预算并生成缓存配置<small>vllm · 2f1041e8dd · L291–313</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/engine/core.py#L291-L313" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/engine/core.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 291                  # NOTE(yongji): should already be set
+ 292                  # during _eep_scale_up_before_kv_init
+ 293                  assert self.available_gpu_memory_for_kv_cache &gt; 0
+ 294                  available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
+ 295                      kv_cache_specs
+ 296                  )
+ 297              else:
+ 298                  # Profiles the peak memory usage of the model to determine how
+ 299                  # much memory can be allocated for kv cache.
+<span class="code-comment">      # [讲解补充] 由 executor 调 worker 估算；这里得到的是各 worker 的预算列表。</span>
+ 300                  available_gpu_memory = self.model_executor.determine_available_memory()
+ 301                  self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+ 302          else:
+ 303              # Attention free models don't need memory for kv cache
+ 304              available_gpu_memory = [0] * len(kv_cache_specs)
+ 305
+ 306          assert len(kv_cache_specs) == len(available_gpu_memory)
+ 307
+ 308          # Track max_model_len before KV cache config to detect auto-fit changes
+ 309          max_model_len_before = vllm_config.model_config.max_model_len
+ 310
+<span class="code-comment">      # [讲解补充] 配置规划同时依赖逐层 spec 和对应的预算。</span>
+ 311          kv_cache_configs = get_kv_cache_configs(
+ 312              vllm_config, kv_cache_specs, available_gpu_memory
+ 313          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 291                  # NOTE(yongji): should already be set
+ 292                  # during _eep_scale_up_before_kv_init
+ 293                  assert self.available_gpu_memory_for_kv_cache &gt; 0
+ 294                  available_gpu_memory = [self.available_gpu_memory_for_kv_cache] * len(
+ 295                      kv_cache_specs
+ 296                  )
+ 297              else:
+ 298                  # Profiles the peak memory usage of the model to determine how
+ 299                  # much memory can be allocated for kv cache.
+ 300                  available_gpu_memory = self.model_executor.determine_available_memory()
+ 301                  self.available_gpu_memory_for_kv_cache = available_gpu_memory[0]
+ 302          else:
+ 303              # Attention free models don't need memory for kv cache
+ 304              available_gpu_memory = [0] * len(kv_cache_specs)
+ 305
+ 306          assert len(kv_cache_specs) == len(available_gpu_memory)
+ 307
+ 308          # Track max_model_len before KV cache config to detect auto-fit changes
+ 309          max_model_len_before = vllm_config.model_config.max_model_len
+ 310
+ 311          kv_cache_configs = get_kv_cache_configs(
+ 312              vllm_config, kv_cache_specs, available_gpu_memory
+ 313          )</code></pre></details></details><details class="source" id="src-m-engine-init"><summary><span>源码证据</span>把解析后的缓存配置发送到 worker 初始化<small>vllm · 2f1041e8dd · L348–362</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/engine/core.py#L348-L362" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/engine/core.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 348          )
+ 349          cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
+ 350              scheduler_kv_cache_config,
+ 351              vllm_config,
+ 352              scheduler_block_size,
+ 353              hash_block_size,
+ 354          )
+ 355          # The scheduler's config is a deep copy taken before these are resolved,
+ 356          # so set them there too: the KV connector's scheduler side reads the same
+ 357          # fields as its workers.
+<span class="code-comment">      # [讲解补充] 把 hash 与命中对齐规则同步到各 worker 配置和 scheduler 配置。</span>
+ 358          for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
+ 359              kv_cache_config.hash_block_size = hash_block_size
+ 360              kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+ 361
+<span class="code-comment">      # [讲解补充] 这一步才让 worker 按已经规划好的配置建立缓存。</span>
+ 362          self.model_executor.initialize_from_config(kv_cache_configs)</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 348          )
+ 349          cache_hit_alignment_tokens = resolve_cache_hit_alignment_tokens(
+ 350              scheduler_kv_cache_config,
+ 351              vllm_config,
+ 352              scheduler_block_size,
+ 353              hash_block_size,
+ 354          )
+ 355          # The scheduler's config is a deep copy taken before these are resolved,
+ 356          # so set them there too: the KV connector's scheduler side reads the same
+ 357          # fields as its workers.
+ 358          for kv_cache_config in (*kv_cache_configs, scheduler_kv_cache_config):
+ 359              kv_cache_config.hash_block_size = hash_block_size
+ 360              kv_cache_config.cache_hit_alignment_tokens = cache_hit_alignment_tokens
+ 361
+ 362          self.model_executor.initialize_from_config(kv_cache_configs)</code></pre></details></details></section>
+<section id="budget"><h2>2. 可用 KV 预算不等于“当前空闲显存”</h2><p>在这份 Ascend worker 源码中，自动估算路径通过 profile 得到非 KV 内存占用，再从 <code>requested_memory</code> 扣除。之后还有多 group、分层复用或 offload 等配置相关调整。理解普通路径时可以先写成：</p><pre><code>普通路径的初始 KV 预算 = requested_memory − profile_result.non_kv_cache_memory</code></pre><p><code>requested_memory</code> 是当前引擎按配置确定的可用预算范围；<code>non_kv_cache_memory</code> 是该 profiling 路径统计的非 KV 占用。不能把操作系统报告的空闲量直接当作最终 KV 预算，也不能把模型权重只减一次就认为所有运行时峰值都已考虑。</p><details class="source" id="src-m-asc-budget"><summary><span>源码证据</span>Ascend 自动预算的初始计算<small>vllm-ascend · e07bf18b76 · L726–729</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/worker/worker.py#L726-L729" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/worker/worker.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 先扣 profile 统计的非 KV 占用；后续仍可能有配置相关调整。</span>
+ 726          self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+ 727          self.available_kv_cache_memory_bytes = self._scale_kv_cache_memory_for_multi_group(
+ 728              self.available_kv_cache_memory_bytes,
+ 729          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 726          self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
+ 727          self.available_kv_cache_memory_bytes = self._scale_kv_cache_memory_for_multi_group(
+ 728              self.available_kv_cache_memory_bytes,
+ 729          )</code></pre></details></details>
+<p>若设置 <code>kv_cache_memory_bytes</code>，代码会进入显式预算路径，跳过这里的自动内存 profiling，但仍执行相应的初始化动作和配置约束。这个参数指定“给 KV 多少空间”，并不凭空增加设备容量；过大的手工值仍可能导致后续分配失败。</p><details class="source" id="src-m-asc-manual"><summary><span>源码证据</span>Ascend 显式 KV 内存预算分支<small>vllm-ascend · e07bf18b76 · L670–689</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/worker/worker.py#L670-L689" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/worker/worker.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 设置显式字节预算会进入这条分支；它不代表设备一定有足够空闲空间。</span>
+ 670          if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+ 671              with set_current_vllm_config(self.vllm_config):
+ 672                  self.model_runner.profile_run(randomize_inputs=randomize_inputs)
+ 673              logger.info(
+ 674                  &quot;Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache &quot;
+ 675                  &quot;as specified by kv_cache_memory_bytes, skipping memory profiling. &quot;
+ 676                  &quot;This does not respect the gpu_memory_utilization config. &quot;
+ 677                  &quot;Only use kv_cache_memory_bytes when you want manual control of &quot;
+ 678                  &quot;KV cache memory size. If OOM'ed, check the difference of initial &quot;
+ 679                  &quot;free memory between the current run and the previous run where &quot;
+ 680                  &quot;kv_cache_memory_bytes is suggested and update it correspondingly.&quot;,
+ 681                  GiB(self.init_snapshot.free_memory),
+ 682                  GiB(kv_cache_memory_bytes),
+ 683              )
+ 684              return self._apply_kvpp_memory_budget(
+ 685                  self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+ 686              )
+ 687
+ 688          # Execute a forward pass with dummy inputs to profile the memory usage
+ 689          # of the model.</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 670          if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
+ 671              with set_current_vllm_config(self.vllm_config):
+ 672                  self.model_runner.profile_run(randomize_inputs=randomize_inputs)
+ 673              logger.info(
+ 674                  &quot;Initial free memory %.2f GiB, reserved %.2f GiB for KV Cache &quot;
+ 675                  &quot;as specified by kv_cache_memory_bytes, skipping memory profiling. &quot;
+ 676                  &quot;This does not respect the gpu_memory_utilization config. &quot;
+ 677                  &quot;Only use kv_cache_memory_bytes when you want manual control of &quot;
+ 678                  &quot;KV cache memory size. If OOM'ed, check the difference of initial &quot;
+ 679                  &quot;free memory between the current run and the previous run where &quot;
+ 680                  &quot;kv_cache_memory_bytes is suggested and update it correspondingly.&quot;,
+ 681                  GiB(self.init_snapshot.free_memory),
+ 682                  GiB(kv_cache_memory_bytes),
+ 683              )
+ 684              return self._apply_kvpp_memory_budget(
+ 685                  self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
+ 686              )
+ 687
+ 688          # Execute a forward pass with dummy inputs to profile the memory usage
+ 689          # of the model.</code></pre></details></details>
+<p>手算时假设单设备给引擎的预算为 20 GiB，profile 计入的非 KV 占用为 14 GiB，且无额外调整，则 KV 初始预算为 6 GiB。这里 <code>1 GiB = 2³⁰ bytes</code>，不要用十进制 GB 混算。真实机器必须读取对应启动日志与配置，不能把这组数字当默认值。</p></section>
+<section id="count-blocks"><h2>3. 预算怎样变成 num_blocks？</h2><p>取一个与上一章不同、但更接近容量量级的教学模型：本 rank 有 32 层，每层普通 GQA 的 <code>Hkv=8</code>、<code>Dk=Dv=128</code>、BF16，管理 block 覆盖 16 token。所有层同组、无额外 padding、无共享层。逐项计算：</p><pre><code>每 token、每层 = 8 × (128 + 128) × 2 = 4096 bytes = 4 KiB
+每页、每层    = 16 × 4096 = 65,536 bytes = 64 KiB
+每个池 ID     = 32 × 65,536 = 2,097,152 bytes = 2 MiB
+候选 ID 总数  = floor(6 GiB / 2 MiB) = 3072</code></pre><p>这里 8 是本 rank 的 KV heads，128 是每个 K/V head 的元素数，2 是 BF16 每元素字节数，16 是每页 token 数，32 是这个 group 包含的层数。<code>num_blocks</code> 是池 ID 总数，不能再乘一遍层数得到“可分配块数”。层数已经计入每个 ID 的物理成本。</p><p>规划器还会检查模型最大长度能否装下，并处理覆盖配置与对齐。<code>num_gpu_blocks_override</code> 等选项会改变通常的取整结果。本例假设这些条件均不改变 3072 这个候选值。</p><p>多个 worker 时不能只拿 rank 0 的预算套全体。源码会按各 worker 的预算和本地布局分别求块数，再取其中最小值，重新生成较大者的 placement。例如一个 worker 能容纳 3072 个 ID，另一个只能容纳 3000 个，最终共同计数为 3000；如果各 rank 的每 ID 字节成本不同，总 backing 大小仍可能不同。</p><details class="source" id="src-m-rank-count"><summary><span>源码证据</span>各 worker 先算容量，再统一到最小块数<small>vllm · 2f1041e8dd · L1607–1636</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_planning.py#L1607-L1636" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/kv_cache_planning.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1607          bytes_per_block = _pool_bytes_per_block_from_builder(
+1608              builder, vllm_config, projected_groups
+1609          )
+<span class="code-comment">      # [讲解补充] 除数是本 worker 的每个池 ID 字节成本，不是单层页大小。</span>
+1610          num_blocks = (
+1611              available_memory_one_worker // bytes_per_block if projected_groups else 1
+1612          )
+1613          kv_cache_configs.append(
+1614              builder.get_kv_cache_config_from_groups(
+1615                  vllm_config, projected_groups, num_blocks
+1616              )
+1617          )
+1618
+1619      # Change the num_blocks of each rank to the smallest among all ranks.
+1620      # We also need to shrink the tensor size proportionally to avoid
+1621      # allocating unused memory.
+<span class="code-comment">      # [讲解补充] 缩减块数时重新规划 placement，确保 stride 和 offset 仍然匹配。</span>
+1622      min_num_blocks = min(
+1623          kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+1624      )
+1625      for i, kv_cache_config in enumerate(kv_cache_configs):
+1626          if kv_cache_config.num_blocks == min_num_blocks:
+1627              continue
+1628          # Re-plan with exactly the smallest rank's block count, so strides and
+1629          # offsets stay consistent with the shrunken allocation.
+1630          kv_cache_configs[i] = builder.get_kv_cache_config_from_groups(
+1631              vllm_config,
+1632              kv_cache_config.kv_cache_groups,
+1633              min_num_blocks,
+1634          )
+1635
+1636      for kv_cache_config in kv_cache_configs:</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1607          bytes_per_block = _pool_bytes_per_block_from_builder(
+1608              builder, vllm_config, projected_groups
+1609          )
+1610          num_blocks = (
+1611              available_memory_one_worker // bytes_per_block if projected_groups else 1
+1612          )
+1613          kv_cache_configs.append(
+1614              builder.get_kv_cache_config_from_groups(
+1615                  vllm_config, projected_groups, num_blocks
+1616              )
+1617          )
+1618
+1619      # Change the num_blocks of each rank to the smallest among all ranks.
+1620      # We also need to shrink the tensor size proportionally to avoid
+1621      # allocating unused memory.
+1622      min_num_blocks = min(
+1623          kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+1624      )
+1625      for i, kv_cache_config in enumerate(kv_cache_configs):
+1626          if kv_cache_config.num_blocks == min_num_blocks:
+1627              continue
+1628          # Re-plan with exactly the smallest rank's block count, so strides and
+1629          # offsets stay consistent with the shrunken allocation.
+1630          kv_cache_configs[i] = builder.get_kv_cache_config_from_groups(
+1631              vllm_config,
+1632              kv_cache_config.kv_cache_groups,
+1633              min_num_blocks,
+1634          )
+1635
+1636      for kv_cache_config in kv_cache_configs:</code></pre></details></details></section>
+<section id="allocate-view"><h2>4. 真正分配的是 backing，再建立各层 view</h2><p>默认 <code>allocate_kv_cache()</code> 检查所有 <code>KVCacheTensor.size</code> 描述同一份 backing，先创建字节 tensor，再逐个 placement 建 view。底层用 <code>torch.int8</code> 分配不表示缓存数值就是 INT8：它在这一步充当原始字节存储，后续由 spec 和 layout 解释为需要的 dtype 与 shape。</p><details class="source" id="src-m-allocate"><summary><span>源码证据</span>默认 worker 创建共享字节 backing<small>vllm · 2f1041e8dd · L578–596</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/utils.py#L578-L596" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/utils.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 578
+<span class="code-comment">      # [讲解补充] 各描述重复记录同一 backing 的 size；不要累加这些 size。</span>
+ 579      sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+ 580      assert len(sizes) == 1, &quot;KV cache tensors must share one backing allocation.&quot;
+ 581      raw_size = sizes.pop()
+ 582      # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
+ 583      # are created lazily on the first qualifying GEMM. Force that now, before
+ 584      # the giant backing allocation below: if one landed in this segment's
+ 585      # rounding tail it would pin the whole segment at engine shutdown.
+ 586      if current_platform.is_rocm():
+ 587          warmup_rocm_skinny_gemm_workspaces(device)
+ 588          # Pad to the page granularity MoRIIO needs to register the shared
+ 589          # backing as a single RDMA memory region. Other platforms keep the
+ 590          # exact-size allocation (see #53974), so anything reading
+ 591          # storage.nbytes() has to tolerate the tail on ROCm alone.
+ 592          page_size = 4096
+ 593          buf_size = ((raw_size + page_size - 1) // page_size) * page_size
+ 594      else:
+ 595          buf_size = raw_size
+<span class="code-comment">      # [讲解补充] int8 是字节容器的 dtype；逐层数值 dtype 由后续 view 决定。</span>
+ 596      buf = torch.zeros(buf_size, dtype=torch.int8, device=device)</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 578
+ 579      sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
+ 580      assert len(sizes) == 1, &quot;KV cache tensors must share one backing allocation.&quot;
+ 581      raw_size = sizes.pop()
+ 582      # wvSplitKrc's process-lifetime static workspaces (csrc/rocm/skinny_gemms.cu)
+ 583      # are created lazily on the first qualifying GEMM. Force that now, before
+ 584      # the giant backing allocation below: if one landed in this segment's
+ 585      # rounding tail it would pin the whole segment at engine shutdown.
+ 586      if current_platform.is_rocm():
+ 587          warmup_rocm_skinny_gemm_workspaces(device)
+ 588          # Pad to the page granularity MoRIIO needs to register the shared
+ 589          # backing as a single RDMA memory region. Other platforms keep the
+ 590          # exact-size allocation (see #53974), so anything reading
+ 591          # storage.nbytes() has to tolerate the tail on ROCm alone.
+ 592          page_size = 4096
+ 593          buf_size = ((raw_size + page_size - 1) // page_size) * page_size
+ 594      else:
+ 595          buf_size = raw_size
+ 596      buf = torch.zeros(buf_size, dtype=torch.int8, device=device)</code></pre></details></details>
+<p>回到容易核对的小例子：两层、每层页 256 bytes、8 个 ID。原始 backing 为 <code>[4096]</code> 的 int8 tensor，共 4096 bytes。每层 view 可以覆盖自己的 8 页，每层逻辑数值容量为 2048 bytes。若采用上一章的 block-outer 布局，两层页交替排列；view 的 stride 反映这种间隔，不能假设每层所有页都连续。</p><p>分配完成后，<code>init_kv_cache()</code> 处理共享层映射、kernel block 适配，再把可绑定的缓存传入 <code>bind_kv_cache_to_layers()</code>。forward 中 Attention 因而能够拿到与自己层名对应的缓存视图。这个绑定动作并不会给每个新请求再复制一份池。</p><details class="source" id="src-m-bind"><summary><span>源码证据</span>缓存分配、共享层映射与 Attention 绑定<small>vllm · 2f1041e8dd · L421–444</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/attn_utils.py#L421-L444" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/gpu/attn_utils.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 421              kv_caches = allocate_kv_cache(
+ 422                  kv_cache_config,
+ 423                  device,
+ 424                  vllm_config.cache_config.get_resolved_kv_cache_layout(),
+ 425                  kernel_block_sizes,
+ 426              )
+<span class="code-comment">      # [讲解补充] 显式共享层可以指向相同缓存对象；这是另一种共享关系。</span>
+ 427      for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
+ 428          kv_caches[layer_name] = kv_caches[target]
+ 429      # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
+ 430      # decoder layer, so a layer name carries two integers (layer + module index).
+ 431      num_attn_module = (
+ 432          2 if vllm_config.model_config.hf_config.model_type == &quot;longcat_flash&quot; else 1
+ 433      )
+ 434      bindable_caches = map_kv_caches_to_kernel_blocks(
+ 435          {name: cache for name, cache in kv_caches.items() if name in forward_context},
+ 436          attn_groups,
+ 437      )
+<span class="code-comment">      # [讲解补充] 将最终 kernel 可用的缓存绑定给对应层。</span>
+ 438      bind_kv_cache_to_layers(
+ 439          bindable_caches,
+ 440          forward_context,
+ 441          num_attn_module,
+ 442          kv_cache_groups=kv_cache_config.kv_cache_groups,
+ 443      )
+ 444      return kv_caches</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 421              kv_caches = allocate_kv_cache(
+ 422                  kv_cache_config,
+ 423                  device,
+ 424                  vllm_config.cache_config.get_resolved_kv_cache_layout(),
+ 425                  kernel_block_sizes,
+ 426              )
+ 427      for layer_name, target in get_shared_kv_cache_layers(vllm_config).items():
+ 428          kv_caches[layer_name] = kv_caches[target]
+ 429      # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
+ 430      # decoder layer, so a layer name carries two integers (layer + module index).
+ 431      num_attn_module = (
+ 432          2 if vllm_config.model_config.hf_config.model_type == &quot;longcat_flash&quot; else 1
+ 433      )
+ 434      bindable_caches = map_kv_caches_to_kernel_blocks(
+ 435          {name: cache for name, cache in kv_caches.items() if name in forward_context},
+ 436          attn_groups,
+ 437      )
+ 438      bind_kv_cache_to_layers(
+ 439          bindable_caches,
+ 440          forward_context,
+ 441          num_attn_module,
+ 442          kv_cache_groups=kv_cache_config.kv_cache_groups,
+ 443      )
+ 444      return kv_caches</code></pre></details></details>
+<p>Ascend V2 的入口也需要单独读：它先复制 cache config，应用平台相关的物理规划，再调用父类初始化。源码明确要求不要在这个过程中修改 scheduler 所持有的逻辑配置。启用特殊分层复用、稀疏 offload 或传输时，实际物理布局要继续追相应分支；普通例子的内存公式不能直接外推。</p><details class="source" id="src-m-asc-init"><summary><span>源码证据</span>Ascend V2 在独立配置副本上应用物理规划<small>vllm-ascend · e07bf18b76 · L442–464</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/worker/v2/model_runner.py#L442-L464" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/worker/v2/model_runner.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 442      def initialize_kv_cache(
+ 443          self,
+ 444          kv_cache_config: KVCacheConfig,
+ 445          kv_cache_allocation_context: AbstractContextManager | None = None,
+ 446      ) -&gt; None:
+ 447          # Match V1's physical buffer plan without mutating the scheduler's
+ 448          # logical cache configuration. Allocation must honor zero-stride aliases.
+<span class="code-comment">      # [讲解补充] 复制配置，避免物理布局调整直接改变 scheduler 的逻辑配置。</span>
+ 449          kv_cache_config = deepcopy(kv_cache_config)
+ 450          sparse_cfg = self.ascend_config.sparse_kv_offload_config
+ 451          configure_dspark_kv_transfer(
+ 452              self.vllm_config, self.speculator, kv_cache_config, is_last_pp_rank=self.is_last_pp_rank
+ 453          )
+ 454          resident_draft_names = get_resident_dspark_layer_names(
+ 455              self.vllm_config,
+ 456              self.speculator,
+ 457              sparse_offload_enabled=sparse_cfg.enabled,
+ 458              is_last_pp_rank=self.is_last_pp_rank,
+ 459              shared_kv_cache_layers=getattr(self, &quot;shared_kv_cache_layers&quot;, None),
+ 460          )
+ 461          # P also needs persistent prompt draft KV until D acknowledges its
+ 462          # transfer. It must never alias target layerwise scratch buffers.
+ 463          persistent_draft_names = resident_draft_names | set(getattr(kv_cache_config, &quot;dspark_draft_layer_names&quot;, ()))
+<span class="code-comment">      # [讲解补充] 启用相应平台特性时，这一步可以改变后续物理缓冲安排。</span>
+ 464          apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config, excluded_layer_names=persistent_draft_names)</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 442      def initialize_kv_cache(
+ 443          self,
+ 444          kv_cache_config: KVCacheConfig,
+ 445          kv_cache_allocation_context: AbstractContextManager | None = None,
+ 446      ) -&gt; None:
+ 447          # Match V1's physical buffer plan without mutating the scheduler's
+ 448          # logical cache configuration. Allocation must honor zero-stride aliases.
+ 449          kv_cache_config = deepcopy(kv_cache_config)
+ 450          sparse_cfg = self.ascend_config.sparse_kv_offload_config
+ 451          configure_dspark_kv_transfer(
+ 452              self.vllm_config, self.speculator, kv_cache_config, is_last_pp_rank=self.is_last_pp_rank
+ 453          )
+ 454          resident_draft_names = get_resident_dspark_layer_names(
+ 455              self.vllm_config,
+ 456              self.speculator,
+ 457              sparse_offload_enabled=sparse_cfg.enabled,
+ 458              is_last_pp_rank=self.is_last_pp_rank,
+ 459              shared_kv_cache_layers=getattr(self, &quot;shared_kv_cache_layers&quot;, None),
+ 460          )
+ 461          # P also needs persistent prompt draft KV until D acknowledges its
+ 462          # transfer. It must never alias target layerwise scratch buffers.
+ 463          persistent_draft_names = resident_draft_names | set(getattr(kv_cache_config, &quot;dspark_draft_layer_names&quot;, ()))
+ 464          apply_layerwise_kv_cache_plan(kv_cache_config, self.vllm_config, excluded_layer_names=persistent_draft_names)</code></pre></details></details></section>
+<section id="null-block"><h2>5. 管理器建立同一套 ID，并保留 null block</h2><p><code>BlockPool</code> 创建从 0 到 <code>num_gpu_blocks−1</code> 的元数据对象，把它们放入空闲队列，再取出 ID 0 作为 <code>null_block</code>。null block 用作占位，不像普通请求页那样维护引用计数，也不能被正常释放回空闲队列。</p><details class="source" id="src-m-null"><summary><span>源码证据</span>建立 block 元数据、空闲队列并取出 null block<small>vllm · 2f1041e8dd · L171–189</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/block_pool.py#L171-L189" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/block_pool.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 171          # All kv-cache blocks.
+<span class="code-comment">      # [讲解补充] 这里只创建管理对象；不是逐块分配设备 tensor。</span>
+ 172          self.blocks: list[KVCacheBlock] = [
+ 173              KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
+ 174          ]
+ 175          # Free block queue that constructs and manipulates a doubly linked
+ 176          # list of free blocks (including eviction candidates when caching is
+ 177          # enabled).
+ 178          self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+ 179
+ 180          # Cache for block lookup
+ 181          self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+ 182          self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+ 183
+ 184          # To represent a placeholder block with block_id=0.
+ 185          # The ref_cnt of null_block is not maintained, needs special care to
+ 186          # avoid freeing it.
+ 187          self.null_block = self.free_block_queue.popleft()
+<span class="code-comment">      # [讲解补充] ID 0 从普通空闲队列移除，作为占位页保留。</span>
+ 188          self.null_block.is_null = True
+ 189  </code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 171          # All kv-cache blocks.
+ 172          self.blocks: list[KVCacheBlock] = [
+ 173              KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
+ 174          ]
+ 175          # Free block queue that constructs and manipulates a doubly linked
+ 176          # list of free blocks (including eviction candidates when caching is
+ 177          # enabled).
+ 178          self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+ 179
+ 180          # Cache for block lookup
+ 181          self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+ 182          self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+ 183
+ 184          # To represent a placeholder block with block_id=0.
+ 185          # The ref_cnt of null_block is not maintained, needs special care to
+ 186          # avoid freeing it.
+ 187          self.null_block = self.free_block_queue.popleft()
+ 188          self.null_block.is_null = True
+ 189  </code></pre></details></details>
+<p>因此，前面的 3072 个物理 ID 中，通常有一个被 null block 保留。单池、无其他预留、无当前请求时，普通可分配 ID 为 <code>3072−1=3071</code>，对应 <code>3071×16=49,136</code> 个 token 槽位。池的物理 backing 仍是 6 GiB，不能因为 null block 不给请求使用就把它从设备分配量中减去。</p><p>小例子的 8 个 ID 同理：4096 bytes backing 已经存在，但普通请求最多使用其余 7 个 ID。在单 group 情况下，请求 A 的 10 个 token 需要 3 个 ID；两层有效 K/V 为 <code>10×64×2=1280 bytes</code>，请求容量为 <code>3×256×2=1536 bytes</code>，整个池仍是 4096 bytes。再加入一个请求，只改变 ID 的所有权与内容，不必让池整体增长。</p></section>
+<section id="startup-audit"><h2>6. 启动后怎样检查自己的理解？</h2><p>沿源码或调试记录保留五份信息：最终逐层 spec、group 的层列表、各 worker 的 KV 预算、生成的 placement 和 num_blocks、逐层 tensor 的 shape/stride/storage。检查以下对应关系，比只记一个“KV 占了多少 GiB”更有用。</p><ul><li>每层是否归入预期 group，是否经过 backend 定制或平台覆盖？</li><li>每个 placement 的页起点和末端是否落在 backing 范围内？</li><li>多个 view 是否共享 storage？统计物理容量时有没有重复累加？</li><li>manager 的 ID 上限与 worker 分配的 block 数是否一致？</li><li>日志中的总块数是否包含 null block，实际还剩多少空闲 ID？</li></ul><p>这些检查解释初始化结果，不等于验证模型数值正确。要验证设备执行，还需要在对应 Ascend 环境运行并记录结果。下一章从这套已经初始化好的池出发，跟踪一个请求经过两轮 prefill 和一步 decode。</p></section>
+<footer><a href="kv-layout.html">← 第 4 章：Cache spec、group 与物理布局</a> · <a href="kv-request-step.html">第 6 章：一轮请求怎样分配、写入和读取 →</a><p><a href="kv-outline.html">KV Cache 完整目录</a> · <a href="THIRD_PARTY_NOTICES.txt">源码归属与许可</a> · <a href="articles.html">原文章索引</a></p></footer></main></div><script src="assets/book/reader.js"></script></body></html>

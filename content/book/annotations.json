@@ -102,5 +102,279 @@
   "runner": {
     "before_line": 1,
     "text": "这段修改 runner 的选择入口；还要沿选中的 runner 继续追分配和绑定过程。"
-  }
+  },
+  "m-attention-spec": [
+    {
+      "before_line": 572,
+      "text": "普通格式按 K 和 V 的维度之和计费；打包格式可以直接覆盖 cell 字节数。"
+    },
+    {
+      "before_line": 582,
+      "text": "page_size_bytes 是分配口径；有 padding 时不能只算有效数值。"
+    }
+  ],
+  "m-state-count": [
+    {
+      "before_line": 257,
+      "text": "tokens_per_state 为正时，把原始 token 覆盖数换算成存储状态数。"
+    }
+  ],
+  "m-state-bytes": [
+    {
+      "before_line": 1096,
+      "text": "先逐项算元素数 × 每元素字节数；不同状态可以使用不同 dtype。"
+    }
+  ],
+  "m-group": [
+    {
+      "before_line": 1485,
+      "text": "这里共享的是索引和管理方式，不意味着各层 K/V 数值相同。"
+    }
+  ],
+  "m-grouping": [
+    {
+      "before_line": 1143,
+      "text": "同样需要一组 token 槽位的层，可以按 uniform type 合组；仍需读取逐层 spec。"
+    }
+  ],
+  "m-placement": [
+    {
+      "before_line": 1458,
+      "text": "l 是本描述 layers 列表的下标；offset 和 stride 的单位均为 bytes。"
+    }
+  ],
+  "m-pool-stride": [
+    {
+      "before_line": 578,
+      "text": "layer-outer 布局按各组的层跨度总和取最大值。"
+    },
+    {
+      "before_line": 587,
+      "text": "block-outer 布局先比较组内页大小总和，随后还会满足对齐要求。"
+    }
+  ],
+  "m-kernel-block": [
+    {
+      "before_line": 636,
+      "text": "只有支持虚拟拆分的 backend 才会选择不同的 kernel block size。"
+    }
+  ],
+  "m-engine-budget": [
+    {
+      "before_line": 300,
+      "text": "由 executor 调 worker 估算；这里得到的是各 worker 的预算列表。"
+    },
+    {
+      "before_line": 311,
+      "text": "配置规划同时依赖逐层 spec 和对应的预算。"
+    }
+  ],
+  "m-engine-init": [
+    {
+      "before_line": 358,
+      "text": "把 hash 与命中对齐规则同步到各 worker 配置和 scheduler 配置。"
+    },
+    {
+      "before_line": 362,
+      "text": "这一步才让 worker 按已经规划好的配置建立缓存。"
+    }
+  ],
+  "m-asc-budget": [
+    {
+      "before_line": 726,
+      "text": "先扣 profile 统计的非 KV 占用；后续仍可能有配置相关调整。"
+    }
+  ],
+  "m-asc-manual": [
+    {
+      "before_line": 670,
+      "text": "设置显式字节预算会进入这条分支；它不代表设备一定有足够空闲空间。"
+    }
+  ],
+  "m-rank-count": [
+    {
+      "before_line": 1610,
+      "text": "除数是本 worker 的每个池 ID 字节成本，不是单层页大小。"
+    },
+    {
+      "before_line": 1622,
+      "text": "缩减块数时重新规划 placement，确保 stride 和 offset 仍然匹配。"
+    }
+  ],
+  "m-allocate": [
+    {
+      "before_line": 579,
+      "text": "各描述重复记录同一 backing 的 size；不要累加这些 size。"
+    },
+    {
+      "before_line": 596,
+      "text": "int8 是字节容器的 dtype；逐层数值 dtype 由后续 view 决定。"
+    }
+  ],
+  "m-bind": [
+    {
+      "before_line": 427,
+      "text": "显式共享层可以指向相同缓存对象；这是另一种共享关系。"
+    },
+    {
+      "before_line": 438,
+      "text": "将最终 kernel 可用的缓存绑定给对应层。"
+    }
+  ],
+  "m-asc-init": [
+    {
+      "before_line": 449,
+      "text": "复制配置，避免物理布局调整直接改变 scheduler 的逻辑配置。"
+    },
+    {
+      "before_line": 464,
+      "text": "启用相应平台特性时，这一步可以改变后续物理缓冲安排。"
+    }
+  ],
+  "m-null": [
+    {
+      "before_line": 172,
+      "text": "这里只创建管理对象；不是逐块分配设备 tensor。"
+    },
+    {
+      "before_line": 188,
+      "text": "ID 0 从普通空闲队列移除，作为占位页保留。"
+    }
+  ],
+  "m-allocate-slots": [
+    {
+      "before_line": 584,
+      "text": "容量检查同时考虑预留块与水位线。"
+    },
+    {
+      "before_line": 585,
+      "text": "失败返回 None；调用方不能当作已获得页继续执行。"
+    },
+    {
+      "before_line": 602,
+      "text": "检查通过后才为后续计算申请新增块。"
+    }
+  ],
+  "m-new-table": [
+    {
+      "before_line": 1246,
+      "text": "新请求从头填写 block IDs；请求槽位与本轮 batch 行号是不同索引。"
+    }
+  ],
+  "m-update-table": [
+    {
+      "before_line": 1274,
+      "text": "增量 IDs 追加到已有表后，不会把旧前缀页全部重传。"
+    }
+  ],
+  "m-prepare-attn": [
+    {
+      "before_line": 1597,
+      "text": "按 idx_mapping 收集本轮 batch 的请求表行。"
+    },
+    {
+      "before_line": 1604,
+      "text": "slot mapping 按本轮 token 生成，包含 padding 时必须使用无效槽位。"
+    }
+  ],
+  "m-optimistic": [
+    {
+      "before_line": 1802,
+      "text": "这是调度进度的推进，不是设备完成通知。"
+    },
+    {
+      "before_line": 1803,
+      "text": "在途数量用于区别已排入执行与已经完成的部分。"
+    }
+  ],
+  "m-prefix-hash": [
+    {
+      "before_line": 735,
+      "text": "父 hash 把更早上下文带入身份；相同局部 token 不足以说明缓存相同。"
+    }
+  ],
+  "m-prefix-group": [
+    {
+      "before_line": 214,
+      "text": "同一 token 前缀在不同 group 中不是同一份缓存。"
+    }
+  ],
+  "m-touch": [
+    {
+      "before_line": 766,
+      "text": "零引用页可能仍有可命中的旧缓存；采用它时先从空闲队列拿走。"
+    },
+    {
+      "before_line": 772,
+      "text": "可原地写入还要求没有缓存 hash，不能只看是否独占。"
+    }
+  ],
+  "m-free": [
+    {
+      "before_line": 795,
+      "text": "减的是请求对 block 的引用，不是释放整个设备 backing。"
+    },
+    {
+      "before_line": 797,
+      "text": "无缓存 hash 的页优先复用；有 hash 的页保留再次命中的机会。"
+    }
+  ],
+  "m-reallocate": [
+    {
+      "before_line": 689,
+      "text": "准备让页承载新内容前，必须撤销旧 hash 对这页的识别。"
+    }
+  ],
+  "m-hit-limit": [
+    {
+      "before_line": 300,
+      "text": "默认上界是 num_tokens−1；后续仍受命中粒度和对齐约束。"
+    }
+  ],
+  "m-preempt": [
+    {
+      "before_line": 1762,
+      "text": "释放可能是延迟归还，取决于是否仍有设备操作在途。"
+    },
+    {
+      "before_line": 1766,
+      "text": "恢复时重新建立计算前缀；请求 token 序列并未在这里删除。"
+    }
+  ],
+  "m-deferred": [
+    {
+      "before_line": 2956,
+      "text": "能安全释放时直接归还；否则将 block 保存到延迟队列。"
+    }
+  ],
+  "m-window": [
+    {
+      "before_line": 1176,
+      "text": "按已安全处理的前缀计算窗口；额外保留区可能推迟回收。"
+    }
+  ],
+  "m-skip-free": [
+    {
+      "before_line": 713,
+      "text": "向下取整：一个块仍有需要的数据时，不能仅释放它的一部分。"
+    }
+  ],
+  "m-mamba-mode": [
+    {
+      "before_line": 1438,
+      "text": "开启 prefix caching 时必须核对 align 模式。"
+    }
+  ],
+  "m-mamba-step": [
+    {
+      "before_line": 1708,
+      "text": "用超出池容量的需求阻止本轮调度，并非真的申请更多内存。"
+    }
+  ],
+  "m-state-copy": [
+    {
+      "before_line": 1294,
+      "text": "先完成复制，再让 forward 读取目标页。"
+    }
+  ]
 }

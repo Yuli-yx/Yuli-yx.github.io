@@ -1,0 +1,363 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="用两轮 prefill 和一步 decode 跟踪 block 增量、表行、slot mapping 与设备完成进度。"><title>一轮请求怎样分配、写入和读取｜推理系统源码读本</title><link rel="stylesheet" href="assets/book/styles.css"></head><body><a class="skip" href="#main">跳到正文</a><div id="progress"></div><button id="menu" aria-label="打开目录" aria-expanded="false">☰ 目录</button><aside class="sidebar"><a class="brand" href="index.html"><span class="brand-mark">kv<span>·</span></span><strong>推理系统源码读本<small>vLLM × vLLM-Ascend</small></strong></a><div class="topic-label">专题导航</div><nav class="topic-nav" aria-label="全站专题"><a href="index.html" >总览 · 推理系统源码读本</a><a href="kv-outline.html" class="selected-topic">KV Cache 管理<small>已写 7 章</small></a><a href="index.html#pd" >P/D 分离<small>规划</small></a><a href="index.html#pool" >KV Pool 池化<small>规划</small></a><a href="index.html#cp" >PCP / DCP<small>规划</small></a><a href="courses/model-runner/index.html" >Model Runner<small>已有</small></a></nav><p class="community-link"><a href="contributing.html">共建说明：要求、计划与接续方法 →</a></p><div class="book-label">KV CACHE 管理 / 第 06 章</div><div class="current-chapter"><strong>一轮请求怎样分配、写入和读取</strong></div><nav aria-label="本章目录"><a href="#schedule-input">1. Scheduler 先决定本轮推进多少 token</a><a href="#runner-table">2. Runner 更新请求表，再排列本轮 batch</a><a href="#write-slot">3. 从 token 位置计算写入槽位</a><a href="#attention-read">4. Attention 写本轮 KV，读所需的历史</a><a href="#three-steps">5. 两轮 prefill 与一步 decode 的完整账本</a><a href="#inflight">6. 调度计数推进，不代表设备已写完</a></nav><details class="book-outline"><summary>本专题大纲 <span>16 章</span></summary><p><a href="kv-outline.html">查看完整目录与模型案例 →</a></p><ol><li><span>01</span><a href="kv-cache.html">谁在管理 KV Cache？</a><small>已编写</small></li><li><span>02</span><a href="kv-attention.html">Attention 结构决定缓存什么</a><small>已编写</small></li><li><span>03</span><a href="kv-model-path.html">从模型配置找到真实实现</a><small>已编写</small></li><li><span>04</span><a href="kv-layout.html">Cache spec、group 与物理布局</a><small>已编写</small></li><li><span>05</span><a href="kv-initialization.html">启动时怎样建立缓存池</a><small>已编写</small></li><li><span>06</span><a href="kv-request-step.html" aria-current="page">一轮请求怎样分配、写入和读取</a><small>本章</small></li><li><span>07</span><a href="kv-reuse.html">复用、回收与恢复</a><small>已编写</small></li><li><span>08</span><a href="kv-outline.html#chapter-08">普通 GQA 模型：完整基线案例</a><small>待写</small></li><li><span>09</span><a href="kv-outline.html#chapter-09">Qwen3.5 / Qwen3.6：Full Attention + GDN</a><small>待写</small></li><li><span>10</span><a href="kv-outline.html#chapter-10">Kimi K3：MLA + KDA</a><small>待写</small></li><li><span>11</span><a href="kv-outline.html#chapter-11">DeepSeek V4：压缩与多类缓存</a><small>待写</small></li><li><span>12</span><a href="kv-outline.html#chapter-12">GLM-5.3：稀疏 Attention 缓存链路</a><small>待写</small></li><li><span>13</span><a href="kv-outline.html#chapter-13">GLM-5.3-Flash：混合 Attention 与辅助状态</a><small>待写</small></li><li><span>14</span><a href="kv-outline.html#chapter-14">同一个请求，在不同模型里会发生什么？</a><small>待写</small></li><li><span>15</span><a href="kv-outline.html#chapter-15">如何算准一个真实模型的缓存容量？</a><small>待写</small></li><li><span>16</span><a href="kv-outline.html#chapter-16">接到系统专题：并行、传输与池化</a><small>待写</small></li></ol></details></aside><div class="page"><header class="topbar"><span><a href="index.html">专题总览</a> / <a href="kv-outline.html">KV Cache 目录</a></span><button id="reading" aria-pressed="false">宽屏阅读</button></header><main id="main"><div class="eyebrow">CHAPTER 06<span>源码 · 例子 · 计算过程</span></div><h1>一轮请求怎样分配、写入和读取</h1><p class="dek">用两轮 prefill 和一步 decode 跟踪 block 增量、表行、slot mapping 与设备完成进度。</p><div class="version"><b>源码基线 / 2026.10.25</b><span>vLLM 2f1041e8dd · Ascend e07bf18b76</span><span>章节更新 / 2026.11.06</span></div><div class="intro"><p>现在设备缓存池已经建好。请求进来后，scheduler 决定本轮推进多少 token，并取得必要的物理 block ID；runner 把这些决定翻译成输入 batch、block table 和 slot mapping；Attention 才执行 K/V 写入与读取。本章按执行顺序逐项对照，特别区分“计划中的进度”和“设备已经完成的进度”。</p><p>教学配置：单 rank、一个 group、两层普通 causal GQA，<code>B=4、Hkv=2、Dk=Dv=8、BF16</code>，每层每页 256 bytes。池有 8 个 ID，0 为 null block。请求 A 有 10 个 prompt token；无 prefix hit、无投机解码、无 P/D、无 CP。本例按同步完成时点观察。指定 ID 只是便于演算，不代表真实空闲队列一定按此顺序分配。</p></div>
+<section id="schedule-input"><h2>1. Scheduler 先决定本轮推进多少 token</h2><p>请求刚进入系统时，有 prompt token IDs 和请求配置，但还没有属于自己的设备 KV 页。scheduler 综合 token budget、请求状态、上下文长度、可用 block 等条件，决定本轮给 A 调度 6 个 token。此时 <code>num_computed_tokens=0</code>，本轮目标是位置 <code>p=0…5</code>。</p><p>对于本例的 Full Attention，如果已有的计算前缀长度是 C，本轮新增 n 个 token，不考虑 lookahead，那么需要能容纳 <code>C+n</code> 个 token 的页。需要的总页数为 <code>ceil((C+n)/B)</code>；实际新增页数还要扣除已持有的页和新命中的可复用页。本轮为 <code>ceil(6/4)=2</code>，假设取得物理 ID <code>[5,2]</code>。</p><p><code>allocate_slots()</code> 会先让各类 manager 处理不再需要的块，再估算所有 group 的分配需求，检查剩余容量；不足时可返回 <code>None</code>。它还会考虑 in-flight 预留、水位线、外部命中、lookahead 等因素。因此实际代码并不是一个孤立的 <code>ceil</code> 公式。本例把这些条件关闭，是为了先看清普通路径。</p><details class="source" id="src-m-allocate-slots"><summary><span>源码证据</span>检查容量、采用命中块、分配新增块<small>vllm · 2f1041e8dd · L568–607</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/kv_cache_manager.py#L568-L607" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/kv_cache_manager.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code> 568          num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+ 569              request_id=request.request_id,
+ 570              num_tokens=num_tokens_need_slot,
+ 571              new_computed_blocks=new_computed_block_list,
+ 572              num_encoder_tokens=num_encoder_tokens,
+ 573              total_computed_tokens=num_local_computed_tokens
+ 574              + num_external_computed_tokens,
+ 575              num_local_computed_tokens=num_local_computed_tokens,
+ 576              num_tokens_main_model=num_tokens_main_model,
+ 577              prefill_end=prefill_end,
+ 578          )
+ 579
+ 580          # Keep `reserved_blocks` free for other in-flight sequences, and an
+ 581          # additional watermark of headroom for waiting/preempted admissions.
+ 582          available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+ 583          required_blocks = num_blocks_to_allocate + watermark_blocks
+<span class="code-comment">      # [讲解补充] 容量检查同时考虑预留块与水位线。</span>
+ 584          if required_blocks &gt; available_blocks:
+<span class="code-comment">      # [讲解补充] 失败返回 None；调用方不能当作已获得页继续执行。</span>
+ 585              # Cannot allocate new blocks
+ 586              return None
+ 587
+ 588          if (
+ 589              new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+ 590              or num_external_computed_tokens &gt; 0
+ 591          ):
+ 592              # Append the new computed blocks to the request blocks until now to
+ 593              # avoid the case where the new blocks cannot be allocated.
+ 594              self.coordinator.allocate_new_computed_blocks(
+ 595                  request_id=request.request_id,
+ 596                  new_computed_blocks=new_computed_block_list,
+ 597                  num_local_computed_tokens=num_local_computed_tokens,
+ 598                  num_external_computed_tokens=num_external_computed_tokens,
+ 599                  skip_zeroing_group_ids=skip_zeroing_group_ids,
+ 600              )
+ 601
+<span class="code-comment">      # [讲解补充] 检查通过后才为后续计算申请新增块。</span>
+ 602          new_blocks = self.coordinator.allocate_new_blocks(
+ 603              request.request_id,
+ 604              num_tokens_need_slot,
+ 605              num_tokens_main_model,
+ 606              num_encoder_tokens,
+ 607          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 568          num_blocks_to_allocate = self.coordinator.get_num_blocks_to_allocate(
+ 569              request_id=request.request_id,
+ 570              num_tokens=num_tokens_need_slot,
+ 571              new_computed_blocks=new_computed_block_list,
+ 572              num_encoder_tokens=num_encoder_tokens,
+ 573              total_computed_tokens=num_local_computed_tokens
+ 574              + num_external_computed_tokens,
+ 575              num_local_computed_tokens=num_local_computed_tokens,
+ 576              num_tokens_main_model=num_tokens_main_model,
+ 577              prefill_end=prefill_end,
+ 578          )
+ 579
+ 580          # Keep `reserved_blocks` free for other in-flight sequences, and an
+ 581          # additional watermark of headroom for waiting/preempted admissions.
+ 582          available_blocks = self.block_pool.get_num_free_blocks() - reserved_blocks
+ 583          required_blocks = num_blocks_to_allocate + watermark_blocks
+ 584          if required_blocks &gt; available_blocks:
+ 585              # Cannot allocate new blocks
+ 586              return None
+ 587
+ 588          if (
+ 589              new_computed_block_list is not self.empty_kv_cache_blocks.blocks
+ 590              or num_external_computed_tokens &gt; 0
+ 591          ):
+ 592              # Append the new computed blocks to the request blocks until now to
+ 593              # avoid the case where the new blocks cannot be allocated.
+ 594              self.coordinator.allocate_new_computed_blocks(
+ 595                  request_id=request.request_id,
+ 596                  new_computed_blocks=new_computed_block_list,
+ 597                  num_local_computed_tokens=num_local_computed_tokens,
+ 598                  num_external_computed_tokens=num_external_computed_tokens,
+ 599                  skip_zeroing_group_ids=skip_zeroing_group_ids,
+ 600              )
+ 601
+ 602          new_blocks = self.coordinator.allocate_new_blocks(
+ 603              request.request_id,
+ 604              num_tokens_need_slot,
+ 605              num_tokens_main_model,
+ 606              num_encoder_tokens,
+ 607          )</code></pre></details></details>
+<p>管理器返回的新 block 对象由 scheduler 转成 ID，放入 <code>SchedulerOutput</code>。新请求会带建立 worker 状态所需的信息；已在 worker 上的请求通常传增量 block IDs 和更新后的进度。这个消息传递的是执行计划与索引，不包含该请求的 K/V 数值。</p><details class="source" id="src-output"><summary><span>源码证据</span>SchedulerOutput：新请求、增量与调度 token 数<small>vllm · 2f1041e8dd · L232–251</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/sched/output.py#L232-L251" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/sched/output.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 调度输出传递请求与执行计划；不是把 K/V tensor 从 scheduler 传给 worker。</span>
+ 232  class SchedulerOutput:
+ 233      # list of the requests that are scheduled for the first time.
+ 234      # We cache the request's data in each worker process, so that we don't
+ 235      # need to re-send it every scheduling step.
+ 236      scheduled_new_reqs: list[NewRequestData]
+ 237      # list of the requests that have been scheduled before.
+ 238      # Since the request's data is already cached in the worker processes,
+ 239      # we only send the diff to minimize the communication cost.
+ 240      scheduled_cached_reqs: CachedRequestData
+ 241
+ 242      # req_id -&gt; num_scheduled_tokens
+ 243      # Number of tokens scheduled for each request.
+ 244      num_scheduled_tokens: dict[str, int]
+ 245      # Total number of tokens scheduled for all requests.
+ 246      # Equal to sum(num_scheduled_tokens.values())
+ 247      total_num_scheduled_tokens: int
+ 248      # req_id -&gt; spec_token_ids
+ 249      # If a request does not have any spec decode tokens, it will not be
+ 250      # included in the dictionary.
+ 251      scheduled_spec_decode_tokens: dict[str, list[int]]</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 232  class SchedulerOutput:
+ 233      # list of the requests that are scheduled for the first time.
+ 234      # We cache the request's data in each worker process, so that we don't
+ 235      # need to re-send it every scheduling step.
+ 236      scheduled_new_reqs: list[NewRequestData]
+ 237      # list of the requests that have been scheduled before.
+ 238      # Since the request's data is already cached in the worker processes,
+ 239      # we only send the diff to minimize the communication cost.
+ 240      scheduled_cached_reqs: CachedRequestData
+ 241
+ 242      # req_id -&gt; num_scheduled_tokens
+ 243      # Number of tokens scheduled for each request.
+ 244      num_scheduled_tokens: dict[str, int]
+ 245      # Total number of tokens scheduled for all requests.
+ 246      # Equal to sum(num_scheduled_tokens.values())
+ 247      total_num_scheduled_tokens: int
+ 248      # req_id -&gt; spec_token_ids
+ 249      # If a request does not have any spec decode tokens, it will not be
+ 250      # included in the dictionary.
+ 251      scheduled_spec_decode_tokens: dict[str, list[int]]</code></pre></details></details></section>
+<section id="runner-table"><h2>2. Runner 更新请求表，再排列本轮 batch</h2><p>worker 为请求建立常驻状态槽位 <code>req_index</code>。这个槽位是 worker 内部索引，不是请求字符串 ID，也不保证等于当前 batch 的第几行。新请求的表用 <code>overwrite=True</code> 从头写；已有请求的新增 ID 用 <code>overwrite=False</code> 追加。</p><details class="source" id="src-m-new-table"><summary><span>源码证据</span>新请求在常驻槽位建立 block table<small>vllm · 2f1041e8dd · L1245–1248</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/model_runner.py#L1245-L1248" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/gpu/model_runner.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1245              self.model_state.add_request(req_index, new_req_data)
+<span class="code-comment">      # [讲解补充] 新请求从头填写 block IDs；请求槽位与本轮 batch 行号是不同索引。</span>
+1246              self.block_tables.append_block_ids(
+1247                  req_index, new_req_data.block_ids, overwrite=True
+1248              )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1245              self.model_state.add_request(req_index, new_req_data)
+1246              self.block_tables.append_block_ids(
+1247                  req_index, new_req_data.block_ids, overwrite=True
+1248              )</code></pre></details></details><details class="source" id="src-m-update-table"><summary><span>源码证据</span>已有请求更新进度并追加新 block IDs<small>vllm · 2f1041e8dd · L1265–1277</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/model_runner.py#L1265-L1277" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/gpu/model_runner.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1265      def update_requests(self, scheduler_output: SchedulerOutput) -&gt; None:
+1266          # Add new blocks and update num_computed_tokens for the existing requests.
+1267          reqs = scheduler_output.scheduled_cached_reqs
+1268          num_computed_tokens_np = self.req_states.num_computed_tokens_np
+1269          for req_id, num_computed_tokens, req_new_block_ids in zip(
+1270              reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
+1271          ):
+1272              req_index = self.req_states.req_id_to_index[req_id]
+1273              num_computed_tokens_np[req_index] = num_computed_tokens
+<span class="code-comment">      # [讲解补充] 增量 IDs 追加到已有表后，不会把旧前缀页全部重传。</span>
+1274              if req_new_block_ids is not None:
+1275                  self.block_tables.append_block_ids(
+1276                      req_index, req_new_block_ids, overwrite=False
+1277                  )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1265      def update_requests(self, scheduler_output: SchedulerOutput) -&gt; None:
+1266          # Add new blocks and update num_computed_tokens for the existing requests.
+1267          reqs = scheduler_output.scheduled_cached_reqs
+1268          num_computed_tokens_np = self.req_states.num_computed_tokens_np
+1269          for req_id, num_computed_tokens, req_new_block_ids in zip(
+1270              reqs.req_ids, reqs.num_computed_tokens, reqs.new_block_ids
+1271          ):
+1272              req_index = self.req_states.req_id_to_index[req_id]
+1273              num_computed_tokens_np[req_index] = num_computed_tokens
+1274              if req_new_block_ids is not None:
+1275                  self.block_tables.append_block_ids(
+1276                      req_index, req_new_block_ids, overwrite=False
+1277                  )</code></pre></details></details>
+<p>首轮收到 <code>[5,2]</code> 后，A 在 group 0 的有效 block table 行为：</p><pre><code>逻辑 block 下标       0           1
+覆盖 token          p=0…3       p=4…7
+物理 block ID         5           2</code></pre><p>这里只调度到 p=5，但第二页已能容纳 p=4…7。p=6、7 对应的槽位属于请求容量，尚不是本轮有效 KV。表的实际缓冲区可能预先开到 <code>max_num_blocks</code>；有效 ID 数、序列长度和 mask 决定哪些项可读，不能把整行的所有整数都当作有效历史。</p><p>runner 收集本轮请求的表行，生成 forward 使用的 block tables。若常驻槽位 A=3、B=8，而本轮 batch 顺序为 B、A，<code>idx_mapping=[8,3]</code> 就负责把 batch 行映射回常驻行。重排 batch 不会改变 A 的逻辑 block 顺序，更不会把 A 的页重新分配一遍。</p><details class="source" id="src-m-prepare-attn"><summary><span>源码证据</span>为本轮 forward 收集表行并生成写入槽位<small>vllm · 2f1041e8dd · L1590–1610</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/model_runner.py#L1590-L1610" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/gpu/model_runner.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1590      def prepare_attn(
+1591          self, input_batch: InputBatch
+1592      ) -&gt; tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+1593          if self.pcp_manager is not None:
+1594              return self.pcp_manager.prepare_attn(input_batch)
+1595
+1596          # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
+<span class="code-comment">      # [讲解补充] 按 idx_mapping 收集本轮 batch 的请求表行。</span>
+1597          block_tables = self.block_tables.gather_block_tables(
+1598              input_batch.idx_mapping,
+1599              num_reqs_padded=input_batch.num_reqs_after_padding,
+1600              num_computed_tokens=self.req_states.num_computed_tokens.gpu,
+1601          )
+1602          # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
+1603          # Kernel pads beyond num_tokens with PAD_SLOT_ID.
+<span class="code-comment">      # [讲解补充] slot mapping 按本轮 token 生成，包含 padding 时必须使用无效槽位。</span>
+1604          slot_mappings = self.block_tables.compute_slot_mappings(
+1605              input_batch.idx_mapping,
+1606              input_batch.query_start_loc,
+1607              input_batch.positions,
+1608              num_tokens_padded=input_batch.num_tokens_after_padding,
+1609          )
+1610          return block_tables, slot_mappings</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1590      def prepare_attn(
+1591          self, input_batch: InputBatch
+1592      ) -&gt; tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+1593          if self.pcp_manager is not None:
+1594              return self.pcp_manager.prepare_attn(input_batch)
+1595
+1596          # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
+1597          block_tables = self.block_tables.gather_block_tables(
+1598              input_batch.idx_mapping,
+1599              num_reqs_padded=input_batch.num_reqs_after_padding,
+1600              num_computed_tokens=self.req_states.num_computed_tokens.gpu,
+1601          )
+1602          # Slot mappings: [num_kv_cache_groups, num_tokens_padded].
+1603          # Kernel pads beyond num_tokens with PAD_SLOT_ID.
+1604          slot_mappings = self.block_tables.compute_slot_mappings(
+1605              input_batch.idx_mapping,
+1606              input_batch.query_start_loc,
+1607              input_batch.positions,
+1608              num_tokens_padded=input_batch.num_tokens_after_padding,
+1609          )
+1610          return block_tables, slot_mappings</code></pre></details></details></section>
+<section id="write-slot"><h2>3. 从 token 位置计算写入槽位</h2><p>对本例无 CP、无压缩的普通分页布局，位置 p 对应：</p><pre><code>逻辑 block 下标 j = floor(p / B)
+块内偏移 o        = p % B
+物理 block ID b   = block_table[A][j]
+slot              = b × B + o</code></pre><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>p</th><th>j</th><th>物理 ID</th><th>o</th><th>slot</th></tr></thead><tbody><tr><td>0</td><td>0</td><td>5</td><td>0</td><td>20</td></tr><tr><td>1</td><td>0</td><td>5</td><td>1</td><td>21</td></tr><tr><td>2</td><td>0</td><td>5</td><td>2</td><td>22</td></tr><tr><td>3</td><td>0</td><td>5</td><td>3</td><td>23</td></tr><tr><td>4</td><td>1</td><td>2</td><td>0</td><td>8</td></tr><tr><td>5</td><td>1</td><td>2</td><td>1</td><td>9</td></tr></tbody></table></div><p>因此本轮 <code>slot_mapping=[20,21,22,23,8,9]</code>。slot 的顺序与本轮输入 token 的顺序对应；值可以跳跃，因为物理页不需要按逻辑顺序连续。slot 20 表示第 5 页的第 0 个 token 槽位，既不是 token ID，也不是第 20 个字节。</p><details class="source" id="src-slot"><summary><span>源码证据</span>slot 计算：block number × block size + offset<small>vllm · 2f1041e8dd · L398–414</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/block_table.py#L398-L414" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/worker/gpu/block_table.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] 普通分页寻址把物理 block 编号和块内偏移合成 slot；它不是字节地址。</span>
+ 398              local_positions = virtual_block_indices * kv_block_size + local_offsets
+ 399              local_positions = tl.where(sharded, local_positions, positions)
+ 400              is_local = ~sharded | is_local
+ 401
+ 402          block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)
+ 403          block_offsets = local_positions % kv_block_size
+ 404          block_numbers = tl.load(
+ 405              block_table_ptr + req_state_idx * block_table_stride + block_indices,
+ 406              mask=is_local &amp; is_real_req,
+ 407              other=0,
+ 408          )
+ 409          slot_ids = block_numbers * kv_block_size + block_offsets
+ 410          if CP_SIZE != 1:
+ 411              slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+ 412
+ 413          slot_ids = tl.where(mapping_enabled &amp; is_real_req, slot_ids, PAD_ID)
+ 414          tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset &lt; end_idx)</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code> 398              local_positions = virtual_block_indices * kv_block_size + local_offsets
+ 399              local_positions = tl.where(sharded, local_positions, positions)
+ 400              is_local = ~sharded | is_local
+ 401
+ 402          block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)
+ 403          block_offsets = local_positions % kv_block_size
+ 404          block_numbers = tl.load(
+ 405              block_table_ptr + req_state_idx * block_table_stride + block_indices,
+ 406              mask=is_local &amp; is_real_req,
+ 407              other=0,
+ 408          )
+ 409          slot_ids = block_numbers * kv_block_size + block_offsets
+ 410          if CP_SIZE != 1:
+ 411              slot_ids = tl.where(is_local, slot_ids, PAD_ID)
+ 412
+ 413          slot_ids = tl.where(mapping_enabled &amp; is_real_req, slot_ids, PAD_ID)
+ 414          tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset &lt; end_idx)</code></pre></details></details>
+<p>一个 group 的 slot mapping 可供组内各层使用，但每层写的是自己的缓存 view。L0 写 p=0 的 K/V 到 L0 的页 5 偏移 0；L1 写到 L1 的页 5 偏移 0。这两份数值来自不同层，不会因为 slot 相同而变成同一份 K/V。</p><p>图执行可能把 token 数补到更大的长度。补出来的槽位会使用无效标记，并由 kernel 的有效范围或 mask 处理。本例表中只有真实 token，不展示 padding 项。CP、压缩存储或状态型缓存有自己的映射规则，不能拿这张表替代它们的 metadata。</p></section>
+<section id="attention-read"><h2>4. Attention 写本轮 KV，读所需的历史</h2><p>在某一层，输入 hidden states 经投影得到本轮 Q、K、V。Q 用于本轮 attention；K/V 要写进此前定位的缓存。Ascend 普通 Attention 的写入调用接收 <code>slot_mapping</code>，读取的 Paged Attention 路径则接收 <code>block_table</code> 和序列长度等信息。</p><details class="source" id="src-write"><summary><span>源码证据</span>Ascend：写 KV 时传入 slot_mapping<small>vllm-ascend · e07bf18b76 · L1184–1205</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/attention/attention_v1.py#L1184-L1205" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/attention/attention_v1.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] slot_mapping 指定本轮 token 的写入槽位；有效槽位的含义由对应 backend 约定。</span>
+1184      def do_kv_cache_update(
+1185          self,
+1186          layer: torch.nn.Module,
+1187          key: torch.Tensor,
+1188          value: torch.Tensor,
+1189          kv_cache: list[torch.Tensor],
+1190          slot_mapping: torch.Tensor,
+1191      ) -&gt; None:
+1192          if self.attn_type in (AttentionType.ENCODER_ONLY):
+1193              return
+1194
+1195          if self.key_cache is None:
+1196              self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+1197
+1198          DeviceOperator.reshape_and_cache(
+1199              key=key,
+1200              value=value,
+1201              key_cache=self.key_cache,
+1202              value_cache=self.value_cache,
+1203              slot_mapping=slot_mapping,
+1204              use_bnsd=self.use_bnsd_kv_cache,
+1205          )</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1184      def do_kv_cache_update(
+1185          self,
+1186          layer: torch.nn.Module,
+1187          key: torch.Tensor,
+1188          value: torch.Tensor,
+1189          kv_cache: list[torch.Tensor],
+1190          slot_mapping: torch.Tensor,
+1191      ) -&gt; None:
+1192          if self.attn_type in (AttentionType.ENCODER_ONLY):
+1193              return
+1194
+1195          if self.key_cache is None:
+1196              self.key_cache, self.value_cache = kv_cache[0], kv_cache[1]
+1197
+1198          DeviceOperator.reshape_and_cache(
+1199              key=key,
+1200              value=value,
+1201              key_cache=self.key_cache,
+1202              value_cache=self.value_cache,
+1203              slot_mapping=slot_mapping,
+1204              use_bnsd=self.use_bnsd_kv_cache,
+1205          )</code></pre></details></details><details class="source" id="src-read"><summary><span>源码证据</span>Ascend：Paged Attention 使用 block_table 和长度<small>vllm-ascend · e07bf18b76 · L1139–1158</small></summary><p><a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/attention/attention_v1.py#L1139-L1158" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm_ascend/attention/attention_v1.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code><span class="code-comment">      # [讲解补充] block_table 定位历史页，序列长度界定有效范围；读取不只依赖本轮写入的 slot。</span>
+1139      def forward_paged_attention(
+1140          self,
+1141          query: torch.Tensor,
+1142          attn_metadata: AscendMetadata,
+1143          output: torch.Tensor | None = None,
+1144      ) -&gt; torch.Tensor:
+1145          if _EXTRA_CTX.capturing:
+1146              return self.full_graph_pa(query, attn_metadata, output)
+1147          torch_npu._npu_paged_attention(
+1148              query=query,
+1149              key_cache=self.key_cache,
+1150              value_cache=self.value_cache,
+1151              num_kv_heads=self.num_kv_heads,
+1152              num_heads=self.num_heads,
+1153              scale_value=self.scale,
+1154              block_table=attn_metadata.block_tables,
+1155              context_lens=attn_metadata.seq_lens,
+1156              out=output,
+1157          )
+1158          return output</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1139      def forward_paged_attention(
+1140          self,
+1141          query: torch.Tensor,
+1142          attn_metadata: AscendMetadata,
+1143          output: torch.Tensor | None = None,
+1144      ) -&gt; torch.Tensor:
+1145          if _EXTRA_CTX.capturing:
+1146              return self.full_graph_pa(query, attn_metadata, output)
+1147          torch_npu._npu_paged_attention(
+1148              query=query,
+1149              key_cache=self.key_cache,
+1150              value_cache=self.value_cache,
+1151              num_kv_heads=self.num_kv_heads,
+1152              num_heads=self.num_heads,
+1153              scale_value=self.scale,
+1154              block_table=attn_metadata.block_tables,
+1155              context_lens=attn_metadata.seq_lens,
+1156              out=output,
+1157          )
+1158          return output</code></pre></details></details>
+<p>两类索引回答的问题不同：slot mapping 回答“这一批新 K/V 写到哪里”；block table 回答“当前请求的历史页在哪里”。对于 p=5，causal attention 只能读 p=0…5。它可以通过 ID 5 读第一段历史，通过 ID 2 读后半段；ID 2 中为 p=6、7 预留的槽位不应当作有效历史参与计算。</p><p>chunked prefill 中，本轮多个 query 的可见范围各不相同。p=0 不能看到 p=1…5，p=5 才能看到本轮之前的所有位置。最终行为要由 query 起止位置、历史长度和 causal mask 一起确定，不能只说“这一轮六个 token 都读到长度 6”。</p><p>这里引用的 Ascend 两个调用说明普通 backend 的接口契约。具体 prefill 可能走融合 Attention 算子，decode 也可能因 shape 和配置切换实现；不能推断所有模式都会执行同一个 Paged Attention 函数。追实际运行路径时，必须检查所在分支以及最终 backend。</p></section>
+<section id="three-steps"><h2>5. 两轮 prefill 与一步 decode 的完整账本</h2><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>观察时点</th><th>本轮输入位置</th><th>新增 ID</th><th>完成后的表</th><th>本轮 slots</th></tr></thead><tbody><tr><td>首轮 prefill 完成</td><td>0…5</td><td>[5,2]</td><td>[5,2]</td><td>[20,21,22,23,8,9]</td></tr><tr><td>第二轮 prefill 完成</td><td>6…9</td><td>[7]</td><td>[5,2,7]</td><td>[10,11,28,29]</td></tr><tr><td>随后一步 decode 完成</td><td>10</td><td>[]</td><td>[5,2,7]</td><td>[30]</td></tr></tbody></table></div><p>第二轮开始前 C=6，新增 n=4，需 <code>ceil(10/4)=3</code> 页；已有 2 页，所以只新增 ID 7。p=6、7 先填完旧页 2，再把 p=8、9 写进新页 7。分配新页并不意味着本轮所有 token 都写新页。</p><p>第二轮 prefill 完成后，最后一个 prompt token p=9 的输出用于采样第一个生成 token，位置为 p=10。<strong>采样出 p=10 的 token ID，并不表示 p=10 的 K/V 已经存在。</strong>下一步把这个 token 作为输入执行 forward，才写入 slot 30，并据此采样 p=11 的 token。这里的“一步 decode 完成”指已经处理输入 p=10。</p><div class="table-scroll" role="region" aria-label="可横向滚动的数据表" tabindex="0"><table><thead><tr><th>设备完成时点</th><th>已存 KV token 数</th><th>两层有效 K/V</th><th>请求分配容量</th><th>池 backing</th></tr></thead><tbody><tr><td>首轮完成</td><td>6</td><td>6 × 64 × 2 = 768 bytes</td><td>2 × 256 × 2 = 1024 bytes</td><td>4096 bytes</td></tr><tr><td>第二轮完成</td><td>10</td><td>10 × 64 × 2 = 1280 bytes</td><td>3 × 256 × 2 = 1536 bytes</td><td>4096 bytes</td></tr><tr><td>decode 完成</td><td>11</td><td>11 × 64 × 2 = 1408 bytes</td><td>3 × 256 × 2 = 1536 bytes</td><td>4096 bytes</td></tr></tbody></table></div><p>64 是每 token 每层 K+V 的字节数，最后的 2 是层数；256 是每层每页字节数。decode 这一步没有新增 ID，有效数据仍增加了 128 bytes，因为它填入已经分配的尾页。等到要处理 p=12 时，才需要第四个逻辑 block。</p></section>
+<section id="inflight"><h2>6. 调度计数推进，不代表设备已写完</h2><p>本章前面的账本选在各步完成之后。实际 scheduler 为了允许流水执行，会在 <code>_update_after_schedule()</code> 中把 <code>num_computed_tokens</code> 加上已调度数量，同时增加 <code>num_in_flight_tokens</code>。因此，若刚调度首轮就看到 <code>num_computed_tokens=6</code>，不能仅凭这一字段断言六份 KV 已经写入。</p><details class="source" id="src-m-optimistic"><summary><span>源码证据</span>调度后先推进计数，并记录 in-flight token<small>vllm · 2f1041e8dd · L1789–1806</small></summary><p><a href="https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/sched/scheduler.py#L1789-L1806" target="_blank" rel="noopener">打开固定提交的完整文件 ↗</a><br><code>vllm/v1/core/sched/scheduler.py</code></p><p class="annotation-note">中文注释为本站讲解补充，不属于上游源码；数字仍为原始行号。</p><pre><code>1789      def _update_after_schedule(self, scheduler_output: SchedulerOutput) -&gt; None:
+1790          # Advance the number of computed tokens for the request AFTER
+1791          # the request is scheduled.
+1792          # 1. The scheduler_output of the current step has to include the
+1793          #    original number of scheduled tokens to determine input IDs.
+1794          # 2. Advance the number of computed tokens here allowing us to
+1795          #    schedule the prefill request again immediately in the next
+1796          #    scheduling step.
+1797          # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
+1798          #    computed tokens will be adjusted in update_from_output.
+1799          num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+1800          for req_id, num_scheduled_token in num_scheduled_tokens.items():
+1801              request = self.requests[req_id]
+<span class="code-comment">      # [讲解补充] 这是调度进度的推进，不是设备完成通知。</span>
+1802              request.num_computed_tokens += num_scheduled_token
+<span class="code-comment">      # [讲解补充] 在途数量用于区别已排入执行与已经完成的部分。</span>
+1803              request.num_in_flight_tokens += num_scheduled_token
+1804              if self.defer_block_free:
+1805                  # Record the in-flight step, to fence deferred block freeing.
+1806                  request.last_sched_seq = self.sched_step_seq</code></pre><details class="original-source"><summary>对照原始摘录（无讲解补充）</summary><pre><code>1789      def _update_after_schedule(self, scheduler_output: SchedulerOutput) -&gt; None:
+1790          # Advance the number of computed tokens for the request AFTER
+1791          # the request is scheduled.
+1792          # 1. The scheduler_output of the current step has to include the
+1793          #    original number of scheduled tokens to determine input IDs.
+1794          # 2. Advance the number of computed tokens here allowing us to
+1795          #    schedule the prefill request again immediately in the next
+1796          #    scheduling step.
+1797          # 3. If some tokens (e.g. spec tokens) are rejected later, the number of
+1798          #    computed tokens will be adjusted in update_from_output.
+1799          num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+1800          for req_id, num_scheduled_token in num_scheduled_tokens.items():
+1801              request = self.requests[req_id]
+1802              request.num_computed_tokens += num_scheduled_token
+1803              request.num_in_flight_tokens += num_scheduled_token
+1804              if self.defer_block_free:
+1805                  # Record the in-flight step, to fence deferred block freeing.
+1806                  request.last_sched_seq = self.sched_step_seq</code></pre></details></details>
+<p>例如调度后计数为 6、in-flight 为 6时，这一步的六个 token 仍可能在执行。模型结果返回后，<code>update_from_output()</code> 消费输出并处理采样、结束条件及相关计数；投机 token 被拒绝或旧输出失效时还需要修正进度。prefix hash 的登记也可能随调度提前发生，安全性要结合执行顺序、依赖和回收保护一起判断，不能拿“hash 已存在”当作任意消费者都能立即读取的证明。</p><p>当请求结束或被抢占，若仍有设备操作访问这些页，scheduler 可以先移出请求记录，把实际归还 block pool 的操作延迟到相应步骤完成。下一章会解释这一点：物理页重新分配前，必须确保旧执行不会再读写它。</p></section>
+<footer><a href="kv-initialization.html">← 第 5 章：启动时怎样建立缓存池</a> · <a href="kv-reuse.html">第 7 章：复用、回收与恢复 →</a><p><a href="kv-outline.html">KV Cache 完整目录</a> · <a href="THIRD_PARTY_NOTICES.txt">源码归属与许可</a> · <a href="articles.html">原文章索引</a></p></footer></main></div><script src="assets/book/reader.js"></script></body></html>

@@ -27,33 +27,45 @@
     "id": "04",
     "part": "共同管理机制",
     "title": "Cache spec、group 与物理布局",
-    "url": null,
-    "status": "待写",
-    "scope": "逐项解释 block size、dtype、page bytes、状态 shape 与压缩比例；跟踪 padding、分组与 backing/view 的关系。"
+    "url": "kv-layout.html",
+    "status": "已编写",
+    "scope": "逐项解释 block size、dtype、page bytes、状态 shape 与压缩比例；跟踪 padding、分组与 backing/view 的关系。",
+    "body": "chapters/04-layout.html",
+    "description": "把模型缓存需求换算成页大小、分组和字节地址，区分每层页、池 ID 与共享 backing。",
+    "updated": "2026.11.06"
   },
   {
     "id": "05",
     "part": "共同管理机制",
     "title": "启动时怎样建立缓存池",
-    "url": null,
-    "status": "待写",
-    "scope": "模型声明、可用内存预算、cache config、设备分配和层绑定；与 scheduler 侧 block 元数据对应。"
+    "url": "kv-initialization.html",
+    "status": "已编写",
+    "scope": "模型声明、可用内存预算、cache config、设备分配和层绑定；与 scheduler 侧 block 元数据对应。",
+    "body": "chapters/05-initialization.html",
+    "description": "从 worker 内存预算到 num_blocks，再追踪设备分配、层绑定与 null block。",
+    "updated": "2026.11.06"
   },
   {
     "id": "06",
     "part": "共同管理机制",
     "title": "一轮请求怎样分配、写入和读取",
-    "url": null,
-    "status": "待写",
-    "scope": "Scheduler 申请 block、下发增量；runner 更新表和 metadata；模型写入与 Attention 读取；结果回写。"
+    "url": "kv-request-step.html",
+    "status": "已编写",
+    "scope": "Scheduler 申请 block、下发增量；runner 更新表和 metadata；模型写入与 Attention 读取；结果回写。",
+    "body": "chapters/06-request-step.html",
+    "description": "用两轮 prefill 和一步 decode 跟踪 block 增量、表行、slot mapping 与设备完成进度。",
+    "updated": "2026.11.06"
   },
   {
     "id": "07",
     "part": "共同管理机制",
     "title": "复用、回收与恢复",
-    "url": null,
-    "status": "待写",
-    "scope": "Prefix caching、引用计数、抢占重算、窗口回收与状态 checkpoint；按缓存类型说明恢复边界。"
+    "url": "kv-reuse.html",
+    "status": "已编写",
+    "scope": "Prefix caching、引用计数、抢占重算、窗口回收与状态 checkpoint；按缓存类型说明恢复边界。",
+    "body": "chapters/07-reuse.html",
+    "description": "跟踪前缀身份、共享引用、淘汰与抢占，再解释滑窗和递归状态的恢复条件。",
+    "updated": "2026.11.06"
   },
   {
     "id": "08",
