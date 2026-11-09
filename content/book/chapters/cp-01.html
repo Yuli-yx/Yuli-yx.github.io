@@ -1,0 +1,106 @@
+<div class="intro">
+  <p>PCP（Prefill Context Parallel）把一次 prefill 的查询 token 分给多个 rank，主要用来缩短长 prompt 的首 token 延迟。DCP（Decode Context Parallel）把同一份 KV 的序列轴切开，多个 rank 各存一段。执行 decode 时，各 rank 用本地 KV 计算部分结果，再合并成完整的 Attention 输出。</p>
+  <p>读这两个特性时，先问三个问题：这个 query 由谁计算？对应的 KV 存在哪个 rank？当前 kernel 用的是哪组请求行和位置索引？这三个答案由不同的步骤决定。</p>
+</div>
+
+<section id="rank-groups"><h2>1. 先看有哪些 rank</h2>
+  <p>在这个版本里，每个 DP 副本、每个 PP stage 有 <code>TP × PCP</code> 个 worker。TP 划分模型计算，例如划分 Attention head。PCP 增加沿上下文协作的 worker。DCP 在这张 rank 网格上建立通信组，复用已经存在的 worker。</p>
+  <table>
+    <thead><tr><th>单副本、单 stage</th><th>TP 坐标 0</th><th>TP 坐标 1</th></tr></thead>
+    <tbody><tr><th>PCP 坐标 0</th><td>全局 rank 0</td><td>全局 rank 1</td></tr><tr><th>PCP 坐标 1</th><td>全局 rank 2</td><td>全局 rank 3</td></tr></tbody>
+  </table>
+  <p>上图的 TP 组按行取，是 <code>[0,1]</code> 和 <code>[2,3]</code>。PCP 组按列取，是 <code>[0,2]</code> 和 <code>[1,3]</code>。如果设 <code>DCP=2</code>，源码按 PCP 坐标优先排列，所以 DCP 组也是 <code>[0,2]</code> 和 <code>[1,3]</code>。在第一组里，全局 rank 2 的 <code>dcp_rank</code> 为 1。后面算 token 归属时，用的是组内 rank。</p>
+  <p>如果某 backend 支持 <code>DCP=TP×PCP=4</code>，同一张网格会形成一个逻辑顺序为 <code>[0,2,1,3]</code> 的 DCP 组。可用的组合取决于模型和 backend。例如该 Ascend 基线对 GQA 的 PCP+DCP 组合要求 <code>DCP=PCP</code>。参见该版本的<a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/docs/source/user_guide/feature_guide/context_parallel.md">上下文并行支持表</a>。</p>
+  {{source:cp-rank-groups}}
+</section>
+
+<section id="pcp-view"><h2>2. PCP 分 query，rank 仍能看到完整 KV</h2>
+  <p>设只有一个请求 A，本轮 prefill 处理位置 <code>p=0…7</code>，此前没有已计算的前缀。取 <code>PCP=2、DCP=1、TP=1</code>，以有完整 KV 副本的普通 Attention 路径为例。每个物理页容纳 <code>B=4</code> 个 token。scheduler 为 A 分配物理页 <code>[5,2]</code>。</p>
+  <p>PCP 的 head–tail 切分把 8 个 query 分为 4 段，每段 2 个 token。rank 0 计算最早和最晚的片段，rank 1 计算中间两段。causal Attention 下，晚位置能看到更长的前缀，把早晚片段配在一起有助于均衡工作量。</p>
+  <figure class="cp-diagram">
+    <figcaption><strong>图 1 · PCP=2，DCP=1</strong><span>上半部是本轮 query 的分工，下半部是各 rank 的请求表和设备页。</span></figcaption>
+    <table>
+      <thead><tr><th>全局 query 片段</th><th>p0、p1</th><th>p2、p3</th><th>p4、p5</th><th>p6、p7</th></tr></thead>
+      <tbody><tr><th>计算 rank</th><td class="cp-r0">rank 0</td><td class="cp-r1">rank 1</td><td class="cp-r1">rank 1</td><td class="cp-r0">rank 0</td></tr></tbody>
+    </table>
+    <table>
+      <thead><tr><th>rank 视野</th><th>本轮局部 query 行</th><th>A 的 block table</th><th>本机 page 5</th><th>本机 page 2</th></tr></thead>
+      <tbody>
+        <tr><th class="cp-r0">rank 0</th><td>A 的 p0–p1、p6–p7</td><td><code>[5, 2]</code></td><td><code>[p0 p1 p2 p3]</code></td><td><code>[p4 p5 p6 p7]</code></td></tr>
+        <tr><th class="cp-r1">rank 1</th><td>A 的 p2–p3、p4–p5</td><td><code>[5, 2]</code></td><td><code>[p0 p1 p2 p3]</code></td><td><code>[p4 p5 p6 p7]</code></td></tr>
+      </tbody>
+    </table>
+  </figure>
+  <p>在这个 PCP-only 路径里，各 rank 计算本地片段的投影，再通过 PCP 组交换 K/V 或写缓存所需的数据。同步后，两端各有一份对应自己 TP 分区的全序列 KV。rank 0 即使只计算了 p0、p1、p6、p7 的 query，也能让 p7 读到 p0…p7 所需的历史。block table 中的 <code>5</code> 指向本机缓存池的第 5 页，两端分别有自己的页。</p>
+  <p>一个全局请求可在某 rank 的本轮 batch 里拆成多条局部片段行。这个例子中，rank 0 的两条 A 片段行都用 <code>idx_mapping</code> 找回 A 的同一条请求状态，因此收集出的两条表行都从 <code>[5,2]</code> 开始。列的逻辑 block 编号不变，行的 query 范围和位置不同。Ascend 的 attention context 还保留 global batch 顺序的表，用于按全局请求组织历史和恢复顺序。这个 global 表同样由本 worker 的表收集而来，表项仍是本机物理页 ID。</p>
+  {{source:cp-pcp-split}}
+  {{source:cp-pcp-tables}}
+  {{source:cp-ascend-global-table}}
+  <p>在固定版本的 Ascend PCP-only decode 路径里，启用 decode 请求分片时，每轮可以按请求轮转选 query 的计算 owner。因为 KV 更新会在 PCP rank 间同步，下一轮可换 owner。叠加 DCP 后，参与 rank 要用各自的历史 KV 分片贡献同一个 decode query 的结果。</p>
+</section>
+
+<section id="dcp-blocks"><h2>3. DCP 的虚拟 block 怎样落到每个 rank</h2>
+  <p>仍取 <code>B=4</code>，现在用两个 DCP rank 管理已写入的 10 个位置 <code>p=0…9</code>。固定一个参与 DCP 分片的普通 Attention cache group，令交织大小 <code>I=2</code>。全局连续的两个 token 为一组，轮流交给 rank 0 和 rank 1。每个 rank 的物理页仍有 4 个槽，一个虚拟 block 合计覆盖 <code>B×D=4×2=8</code> 个全局位置。</p>
+  <figure class="cp-diagram">
+    <figcaption><strong>图 2 · DCP=2，B=4，I=2，当前长度 T=10</strong><span>每条表行的第 0、1 列分别是 5、2。同一列对应同一个全局位置范围，各 rank 的页内容由交织规则决定。</span></figcaption>
+    <table>
+      <thead><tr><th>全局虚拟 block</th><th>列 0 · p0–p7</th><th>列 1 · p8–p15</th></tr></thead>
+      <tbody>
+        <tr><th>全局位置的 KV owner</th><td><span class="cp-chip cp-r0">p0 p1</span> <span class="cp-chip cp-r1">p2 p3</span> <span class="cp-chip cp-r0">p4 p5</span> <span class="cp-chip cp-r1">p6 p7</span></td><td><span class="cp-chip cp-r0">p8 p9</span> <span class="cp-chip cp-empty">p10–p15 尚未写</span></td></tr>
+        <tr><th class="cp-r0">rank 0 · 本机表 [5,2]</th><td><b>page 5</b> <code>[p0 p1 p4 p5]</code></td><td><b>page 2</b> <code>[p8 p9 · ·]</code></td></tr>
+        <tr><th class="cp-r1">rank 1 · 本机表 [5,2]</th><td><b>page 5</b> <code>[p2 p3 p6 p7]</code></td><td><b>page 2</b> <code>[· · · ·]</code></td></tr>
+      </tbody>
+    </table>
+    <p class="caption">页内从左到右是本地 offset 0…3。「·」表示此请求在当前长度下没有有效 KV。绿色对应 rank 0，蓝色对应 rank 1。</p>
+  </figure>
+  <p>manager 用 <code>ceil(T/(B×D))</code> 计算本例需要的逻辑 block 数，<code>T=10</code> 时得到 2。调度下发的两个 ID 都出现在 worker 表中，所以 rank 1 的尾页也已占用一个 ID，当前有效长度却只有 4。rank 0 的有效长度是 6。这就是 Attention metadata 还需要 <code>dcp_local_seq_lens</code> 的原因。仅看 <code>[5,2]</code> 无法判断每个 rank 有多少有效 KV。</p>
+  {{source:cp-manager-block}}
+  <p>本地长度可以按交织轮次手算。<code>T=10</code> 含 <code>10//(I×D)=2</code> 个完整轮次，各 rank 先分到 <code>2×I=4</code> 个 token。余下两个位置从 rank 0 开始分，所以 rank 0 再加 2，rank 1 再加 0。一个完整轮次涵盖 4 个位置，一个虚拟 block 涵盖 8 个位置，两者的边界不同。</p>
+  {{source:cp-local-len}}
+  <p>容量也可从图上算。设 <code>s</code> 为一份 token KV 在单层、该 head 分区下的字节数，两 rank 本来各复制 10 份时，有效数据共 <code>20s</code>。DCP 后两端共存 <code>(6+4)s=10s</code>。按每 rank 的完整页计费，各用了 <code>2×4=8</code> 个槽，共 <code>16s</code>，其中 6 个槽暂未使用。实际池仍按启动时分配的总页数计量。</p>
+</section>
+
+<section id="dcp-slot"><h2>4. 从全局位置算 rank、表列和本地 slot</h2>
+  <p>以下公式对应启用 DCP 分片的普通 token 缓存路径。<code>D</code> 为 DCP 组大小，<code>B</code> 为这里 kernel 寻址的页大小，<code>I</code> 为生效的交织粒度。图中管理页与 kernel 页大小相同，且 <code>I</code> 整除 <code>B</code>。</p>
+  <pre><code>v        = p // (B × D)                 # 表的逻辑列
+u        = p %  (B × D)                 # 虚拟 block 内的位置
+owner    = (u // I) % D                  # DCP 组内 rank
+offset   = (u // (I × D)) × I + u % I   # owner 页内的偏移
+slot     = block_table[A][v] × B + offset
+非 owner  = PAD_SLOT_ID (-1)</code></pre>
+  <table>
+    <thead><tr><th>全局 p</th><th>表列 v</th><th>owner</th><th>本地页 / offset</th><th>rank 0 slot</th><th>rank 1 slot</th></tr></thead>
+    <tbody>
+      <tr><td>3</td><td>0</td><td>1</td><td>5 / 1</td><td>−1</td><td>21</td></tr>
+      <tr><td>7</td><td>0</td><td>1</td><td>5 / 3</td><td>−1</td><td>23</td></tr>
+      <tr><td>8</td><td>1</td><td>0</td><td>2 / 0</td><td>8</td><td>−1</td></tr>
+      <tr><td>10（下一次写入）</td><td>1</td><td>1</td><td>2 / 0</td><td>−1</td><td>8</td></tr>
+    </tbody>
+  </table>
+  <p>手算 <code>p=7</code> 时，<code>v=0</code>、<code>u=7</code>、<code>owner=(7//2)%2=1</code>，页内偏移为 <code>(7//4)×2+7%2=3</code>，所以写入 rank 1 的 <code>5×4+3=23</code>。如果把 PCP 与 DCP 叠加，图 1 的 p7 query 在 PCP rank 0 计算，而图 2 的 p7 KV 归 DCP rank 1。两组恰好沿同一批 worker 时，这个例子仍可出现计算与存储归属分开。backend 按所需顺序整理交换来的数据及 slot，实际写入由 owner 的有效 slot 决定。</p>
+  <p>对非 owner，<code>−1</code> 是写入映射的跳过标记。它并不会删除该 rank 的表列。两个 rank 各自出现 <code>slot=8</code> 也很正常：p8 写入 rank 0 的本机 slot 8，p10 写入 rank 1 的本机 slot 8。若某个 group 声明 <code>dcp_sharded=False</code>，源码会保留原始位置和各 rank 的正常写入视图。混合模型要逐 group 核对。</p>
+  {{source:cp-slot}}
+</section>
+
+<section id="attention-merge"><h2>5. Decode 怎样用各 rank 的历史得到同一个输出</h2>
+  <p>以 Ascend 普通 GQA 的 DCP 路径为例，backend 准备每个 rank 需要的 query heads，读取该 rank 的 KV 与本地有效长度，计算局部 Attention 输出 <code>Oᵣ</code> 和局部 softmax 的 <code>LSEᵣ</code>。同一 query 会看到所有有效 KV 分片的贡献。组内的 query heads 如果已经相同，准备步骤可以复用当前 query。涉及不同 TP head 分区时，backend 需要相应的 head 交换。</p>
+  <pre><code>Zᵣ   = Σ exp(score)                 # rank r 上可见 token 的分数总质量
+LSEᵣ = log(Zᵣ)
+m    = max(LSEᵣ)
+wᵣ   = exp(LSEᵣ − m)
+O    = Σ(wᵣ × Oᵣ) / Σ(wᵣ)</code></pre>
+  <p>各 rank 的局部输出已经按本地 <code>Zᵣ</code> 归一化。合并时用 LSE 恢复相对权重。例如两个分片的 <code>Z</code> 分别为 3 和 1，输出权重就是 <code>3/4</code> 和 <code>1/4</code>。减去最大的 LSE 用于数值稳定。源码示例同时处理自然对数和以 2 为底的 LSE，权重分别用 <code>exp</code> 或 <code>2^x</code> 还原。</p>
+  {{source:cp-ascend-decode}}
+  {{source:cp-lse}}
+  <p>DCP 开启后，后续的 chunked prefill 也需要访问已经分布的历史 KV。固定版本的 Ascend 实现中，GQA 可准备 query 后用本地 KV 算分片结果，MLA 可分段收集历史 latent KV。实际通信位置还取决于 backend、图模式和当前 batch。</p>
+</section>
+
+<section id="reading-checklist"><h2>6. 读实际运行日志时对齐这几项</h2>
+  <ol>
+    <li>从并行组确认当前 worker 的 <code>pcp_rank</code>、<code>dcp_rank</code> 和 <code>tp_rank</code>，同时记下 DCP 组内 rank 顺序。</li>
+    <li>确认该 cache group 的 <code>dcp_sharded</code>、manager 页大小、kernel 页大小和生效的交织粒度（配置项 <code>--cp-kv-cache-interleave-size</code>）。这个版本的 SFA+DCP 按 block 大小交织，稀疏 indexer 还可能采用独立的复制布局。</li>
+    <li>同一请求同时记录全局位置、局部 query 行、block table 行、slot mapping 和每 rank 的有效 KV 长度。用图 2 的方法检查尾页与空 slot。</li>
+    <li>启用 P/D 或外部 KV 池时，把两端的 rank 组、交织粒度和 connector 约束一起核对。固定版本的 Ascend DCP 传输路径要求显式把 interleave 设为 block 大小。参见<a href="https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/docs/source/developer_guide/Design_Documents/context_parallel.md">Ascend 上下文并行设计文档</a>。</li>
+  </ol>
+  <p class="caption">图中的 B=4、I=2 与页号为手算设置。源码摘录来自页面标注的提交。容量和索引已经按源码公式核对，设备性能需按实际模型与部署组合测量。</p>
+</section>

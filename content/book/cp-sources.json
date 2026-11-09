@@ -1,0 +1,101 @@
+{
+  "cp-rank-groups": {
+    "repo": "vllm",
+    "path": "vllm/distributed/parallel_state.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 2239,
+    "end": 2264,
+    "title": "DCP 和 PCP 如何从现有 rank 建组",
+    "file_sha256": "862b722012fc8a32a75028657146599cd06b341ecafb203e77e2138dd4e66b4a",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/distributed/parallel_state.py#L2239-L2264",
+    "code": "2239      # Build the DCP model-parallel groups.\n2240      global _DCP\n2241      assert _DCP is None, \"decode context model parallel group is already initialized\"\n2242      dcp_size = decode_context_model_parallel_size or 1\n2243      dcp_ranks = local_all_ranks if enable_elastic_ep else all_ranks\n2244      if dcp_size > 1:\n2245          # DCP spans PCP first, then TP for full TP x PCP groups.\n2246          dcp_ranks = dcp_ranks.transpose(-1, -2)\n2247      group_ranks = dcp_ranks.reshape(-1, dcp_size).unbind(0)\n2248      group_ranks = [x.tolist() for x in group_ranks]\n2249      _DCP = init_model_parallel_group(\n2250          group_ranks,\n2251          get_world_group().local_rank,\n2252          backend,\n2253          use_message_queue_broadcaster=True,\n2254          group_name=\"dcp\",\n2255      )\n2256  \n2257      global _PCP\n2258      assert _PCP is None, \"prefill context parallel group is already initialized\"\n2259      group_ranks = (\n2260          all_ranks.transpose(3, 4)\n2261          .reshape(-1, prefill_context_model_parallel_size)\n2262          .unbind(0)\n2263      )\n2264      group_ranks = [x.tolist() for x in group_ranks]"
+  },
+  "cp-pcp-split": {
+    "repo": "vllm",
+    "path": "vllm/v1/worker/gpu/pcp_manager.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 287,
+    "end": 316,
+    "title": "Head–tail 切分与 decode 的 query 分配",
+    "file_sha256": "286b4edacc8deccdea01053070c8f7f7f245066ce1e47d52db64c6af630f43f5",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/pcp_manager.py#L287-L316",
+    "code": " 287          decode_ordinal = 0\n 288          num_chunks = 2 * self.pcp_world_size\n 289          replicated = self.replicated_requests(num_scheduled_tokens, is_prefilling)\n 290          for global_batch_req_idx, num_tokens in enumerate(num_scheduled_tokens):\n 291              query_len = int(num_tokens)\n 292              if query_len == 0:\n 293                  continue\n 294              chunk_indices: tuple[int, ...]\n 295              if not replicated[global_batch_req_idx]:\n 296                  chunk_size = (query_len + num_chunks - 1) // num_chunks\n 297                  chunk_indices = (rank, num_chunks - 1 - rank)\n 298              elif self.shard_decode_requests:\n 299                  chunk_size = query_len\n 300                  # KV and hidden states are gathered back to every PCP rank, so\n 301                  # decode ownership does not need to persist across steps. Use a\n 302                  # compact decode-only ordinal to keep each step exactly\n 303                  # balanced even when prefills and zero-token rows are present.\n 304                  owner_rank = decode_ordinal % self.pcp_world_size\n 305                  decode_ordinal += 1\n 306                  chunk_indices = (0,) if rank == owner_rank else ()\n 307              else:  # DCP requires decode queries on every participating rank.\n 308                  chunk_size = query_len\n 309                  chunk_indices = (0,)\n 310  \n 311              for chunk_idx in chunk_indices:\n 312                  chunk_offset = chunk_idx * chunk_size\n 313                  chunk_len = min(chunk_size, query_len - chunk_offset)\n 314                  if chunk_len <= 0:\n 315                      continue\n 316                  yield global_batch_req_idx, chunk_offset, chunk_len"
+  },
+  "cp-pcp-tables": {
+    "repo": "vllm",
+    "path": "vllm/v1/worker/gpu/pcp_manager.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 771,
+    "end": 798,
+    "title": "局部 query 选择表行，全局位置生成写入映射",
+    "file_sha256": "286b4edacc8deccdea01053070c8f7f7f245066ce1e47d52db64c6af630f43f5",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/pcp_manager.py#L771-L798",
+    "code": " 771      def prepare_attn(\n 772          self, input_batch: InputBatch\n 773      ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:\n 774          assert self._block_tables is not None\n 775          assert self._local_block_tables is not None\n 776          assert self._local_block_table_ptrs is not None\n 777          block_tables = self._block_tables.gather_block_tables(\n 778              input_batch.idx_mapping,\n 779              input_batch.num_reqs_after_padding,\n 780              out=self._local_block_tables,\n 781              out_ptrs=self._local_block_table_ptrs,\n 782          )\n 783          slot_mappings = self.prepare_slot_mappings()\n 784          return block_tables, slot_mappings\n 785  \n 786      def prepare_slot_mappings(self) -> torch.Tensor:\n 787          assert self._block_tables is not None\n 788          assert self._global_batch_slot_mappings is not None\n 789          assert self._global_batch is not None\n 790          global_batch = self._global_batch\n 791          global_batch_slot_mappings = self._block_tables.compute_slot_mappings(\n 792              global_batch.idx_mapping,\n 793              global_batch.query_start_loc,\n 794              global_batch.positions,\n 795              global_batch.num_tokens,\n 796              out=self._global_batch_slot_mappings,\n 797          )\n 798          return self._convert_to_gathered_slot_mappings(global_batch_slot_mappings)"
+  },
+  "cp-ascend-global-table": {
+    "repo": "vllm-ascend",
+    "path": "vllm_ascend/worker/v2/pcp_manager.py",
+    "commit": "e07bf18b76ce8543baffafa9ba868e86305d15b2",
+    "start": 820,
+    "end": 845,
+    "title": "Ascend 保留全局请求顺序与局部片段的对应关系",
+    "file_sha256": "d44aef7e65df96f3289ffbbe9cc7070c49af50336fe9acc25182f5baaa012838",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/worker/v2/pcp_manager.py#L820-L845",
+    "code": " 820          global_block_table_num_blocks = None\n 821          local_to_global_req_indices = None\n 822          if self.dcp_world_size > 1 and bool(global_batch.is_prefilling_np.any()):\n 823              global_block_table_num_blocks = torch.from_numpy(\n 824                  self._block_tables.num_blocks.np[:, global_batch.idx_mapping_np[: global_batch.num_reqs]]\n 825              ).to(device=self.device, non_blocking=True)\n 826              global_rows = {\n 827                  int(state): row for row, state in enumerate(global_batch.idx_mapping_np[: global_batch.num_reqs])\n 828              }\n 829              local_to_global_req_indices = tuple(\n 830                  global_rows[int(state)] for state in local_batch.idx_mapping_np[: local_batch.num_reqs]\n 831              )\n 832          return AscendPCPAttentionContext(\n 833              global_batch=global_batch,\n 834              local_to_global_req_indices=local_to_global_req_indices,\n 835              local_token_indices=self._local_gather_idx[: local_batch.num_tokens],\n 836              global_block_tables=self._block_tables.gather_block_tables(\n 837                  global_batch.idx_mapping,\n 838                  global_batch.num_reqs_after_padding,\n 839              ),\n 840              global_slot_mappings=self._global_batch_slot_mappings[:, : global_batch.num_tokens_after_padding],\n 841              hidden_restore_idx=hidden_restore_idx,\n 842              padded_gather_idx=self._padded_gather_idx,\n 843              gathered_kv_write_mask=self._gathered_kv_write_mask,\n 844              global_block_table_num_blocks=global_block_table_num_blocks,\n 845          )"
+  },
+  "cp-manager-block": {
+    "repo": "vllm",
+    "path": "vllm/v1/core/single_type_kv_cache_manager.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 102,
+    "end": 112,
+    "title": "缓存管理器的虚拟 block 容量",
+    "file_sha256": "2c828fa2c82f932ec71b063d99b4c9e2b6affc88d5b2c1e345c882ca1b656330",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/core/single_type_kv_cache_manager.py#L102-L112",
+    "code": " 102          self.scheduler_block_size = scheduler_block_size\n 103          # Hybrid fine-grained lookup may lower this after all participating\n 104          # managers have been validated by the coordinator.\n 105          self.cache_hit_alignment_tokens = scheduler_block_size\n 106          # The block size for this manager; used for actual block allocation.\n 107          self.dcp_world_size = dcp_world_size if kv_cache_spec.dcp_sharded else 1\n 108          self.pcp_world_size = pcp_world_size if kv_cache_spec.dcp_sharded else 1\n 109          self.block_size = kv_cache_spec.block_size * self.dcp_world_size\n 110          self.kv_cache_spec = kv_cache_spec\n 111          self.block_pool = block_pool\n 112          self.enable_caching = enable_caching"
+  },
+  "cp-slot": {
+    "repo": "vllm",
+    "path": "vllm/v1/worker/gpu/block_table.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 385,
+    "end": 414,
+    "title": "从全局位置计算 DCP owner 和本地 slot",
+    "file_sha256": "3433729cad5aa5fceb312e0a8d9ffabb3f7327dbdd18966d576e64d090313020",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/worker/gpu/block_table.py#L385-L414",
+    "code": " 385          if CP_SIZE == 1:\n 386              # Common case: Context parallelism is not used.\n 387              local_positions = positions\n 388              is_local = True\n 389          else:\n 390              # Context parallelism is used.\n 391              virtual_block_size = kv_block_size * CP_SIZE\n 392              virtual_block_indices = positions // virtual_block_size\n 393              virtual_block_offsets = positions % virtual_block_size\n 394              is_local = virtual_block_offsets // CP_INTERLEAVE % CP_SIZE == cp_rank\n 395              rounds = virtual_block_offsets // (CP_INTERLEAVE * CP_SIZE)\n 396              remainder = virtual_block_offsets % CP_INTERLEAVE\n 397              local_offsets = rounds * CP_INTERLEAVE + remainder\n 398              local_positions = virtual_block_indices * kv_block_size + local_offsets\n 399              local_positions = tl.where(sharded, local_positions, positions)\n 400              is_local = ~sharded | is_local\n 401  \n 402          block_indices = tl.where(mapping_enabled, local_positions // kv_block_size, 0)\n 403          block_offsets = local_positions % kv_block_size\n 404          block_numbers = tl.load(\n 405              block_table_ptr + req_state_idx * block_table_stride + block_indices,\n 406              mask=is_local & is_real_req,\n 407              other=0,\n 408          )\n 409          slot_ids = block_numbers * kv_block_size + block_offsets\n 410          if CP_SIZE != 1:\n 411              slot_ids = tl.where(is_local, slot_ids, PAD_ID)\n 412  \n 413          slot_ids = tl.where(mapping_enabled & is_real_req, slot_ids, PAD_ID)\n 414          tl.store(slot_mapping_ptr + offset, slot_ids, mask=offset < end_idx)"
+  },
+  "cp-ascend-decode": {
+    "repo": "vllm-ascend",
+    "path": "vllm_ascend/attention/context_parallel/attention_cp.py",
+    "commit": "e07bf18b76ce8543baffafa9ba868e86305d15b2",
+    "start": 460,
+    "end": 481,
+    "title": "Ascend GQA 在本地 KV 上计算并合并输出",
+    "file_sha256": "2f9fa293593dd1e71d68126d0ee753b4a76c078ae58336ce4f7260ef483aafcf",
+    "url": "https://github.com/vllm-project/vllm-ascend/blob/e07bf18b76ce8543baffafa9ba868e86305d15b2/vllm_ascend/attention/context_parallel/attention_cp.py#L460-L481",
+    "code": " 460      def _forward_decode_dcp(\n 461          self,\n 462          query: torch.Tensor,\n 463          attn_metadata: AscendAttentionDCPMetadata,\n 464          current_key: torch.Tensor | None = None,\n 465          current_value: torch.Tensor | None = None,\n 466      ) -> torch.Tensor:\n 467          assert self.key_cache is not None and self.value_cache is not None\n 468          (history_query,) = self._dcp_all_gather_fragments(query, dim=1)\n 469          num_heads = history_query.shape[1]\n 470          key = self.key_cache.view(self.key_cache.shape[0], self.key_cache.shape[1], -1)\n 471          value = self.value_cache.view(self.value_cache.shape[0], self.value_cache.shape[1], -1)\n 472          use_split = use_history_current_split_decode(\n 473              attn_metadata,\n 474              is_draft_model=_EXTRA_CTX.is_draft_model,\n 475              is_draft_model_prefill=_EXTRA_CTX.is_draft_model_prefill,\n 476              use_spec_decode=self.vllm_config.speculative_config is not None,\n 477          )\n 478          kind = CPKVScope.HISTORY if use_split else CPKVScope.FULL\n 479          history_output, history_lse = self._run_dcp_attention(history_query, key, value, attn_metadata, kind, num_heads)\n 480          if not use_split:\n 481              return self._merge_dcp_attention_output(history_output, history_lse)"
+  },
+  "cp-lse": {
+    "repo": "vllm",
+    "path": "vllm/v1/attention/ops/dcp.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 568,
+    "end": 592,
+    "title": "按 LSE 恢复分片权重并合并",
+    "file_sha256": "f76296c841363f26c83908229eaddabfce665a9a39b7e802d252885d6d15353e",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/attention/ops/dcp.py#L568-L592",
+    "code": " 568      # Compute max LSE for numerical stability\n 569      lse_max, _ = lses.max(dim=0)  # [B, H]\n 570      lse_max = torch.where(\n 571          lse_max == float(\"-inf\"),\n 572          torch.zeros_like(lse_max),\n 573          lse_max,\n 574      )\n 575  \n 576      # Compute weights: softmax over the N dimension\n 577      if is_lse_base_on_e:\n 578          weights = torch.exp(lses - lse_max.unsqueeze(0))  # [N, B, H]\n 579      else:\n 580          weights = torch.pow(2.0, lses - lse_max.unsqueeze(0))  # [N, B, H]\n 581  \n 582      # Handle NaN weights\n 583      weights = torch.where(torch.isnan(weights), torch.zeros_like(weights), weights)\n 584  \n 585      # Normalize weights\n 586      weight_sum = weights.sum(dim=0, keepdim=True)  # [1, B, H]\n 587      weights = weights / weight_sum.clamp(min=1e-10)  # [N, B, H]\n 588  \n 589      # Weighted combination: sum over N dimension\n 590      weights = weights.unsqueeze(-1)\n 591      outputs = torch.where(weights == 0, torch.zeros_like(outputs), outputs)\n 592      result = (outputs * weights).sum(dim=0)  # [B, H, D]"
+  },
+  "cp-local-len": {
+    "repo": "vllm",
+    "path": "vllm/v1/attention/backends/utils.py",
+    "commit": "2f1041e8dd05415d9984d0a83ad957d54a049eb4",
+    "start": 1198,
+    "end": 1211,
+    "title": "按完整交织轮次和尾部 token 计算本地长度",
+    "file_sha256": "c1b7f17960f02c5e40b89a06356f13c9be26d2486df151b671a4e81bc7d2ebb0",
+    "url": "https://github.com/vllm-project/vllm/blob/2f1041e8dd05415d9984d0a83ad957d54a049eb4/vllm/v1/attention/backends/utils.py#L1198-L1211",
+    "code": "1198      base = (\n1199          seq_lens_tiled\n1200          // cp_kv_cache_interleave_size\n1201          // dcp_size\n1202          * cp_kv_cache_interleave_size\n1203      )\n1204      remainder = seq_lens_tiled - base * dcp_size\n1205      remainder = torch.clip(\n1206          remainder - rank_offsets * cp_kv_cache_interleave_size,\n1207          0,\n1208          cp_kv_cache_interleave_size,\n1209      )\n1210      dcp_local_seq_lens = base + remainder\n1211      return dcp_local_seq_lens"
+  }
+}

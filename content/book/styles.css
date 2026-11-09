@@ -7,3 +7,56 @@
 .code-comment{color:#286443;font-style:normal}.annotation-note{font-size:13px;color:var(--muted)}.original-source{margin:12px 0}.original-source summary{cursor:pointer;font-size:13px}.community-link{font-size:13px;line-height:1.6;margin:18px 0}
 
 .table-scroll{max-width:100%;overflow-x:auto;margin:20px 0}.table-scroll table{margin:0;min-width:560px}.table-scroll:focus-visible{outline:2px solid var(--green);outline-offset:3px}
+
+/* Context-parallel diagrams: the text labels carry the same meaning as color. */
+.cp-diagram {
+  margin: 1.75rem 0;
+  padding: 1rem;
+  border: 1px solid #d5dece;
+  border-radius: 0.65rem;
+  background: #f2f6ef;
+}
+.cp-diagram figcaption strong,
+.cp-diagram figcaption span {
+  display: block;
+}
+.cp-diagram figcaption span {
+  font-size: 0.9rem;
+  color: var(--muted);
+}
+.cp-diagram .table-scroll {
+  margin: 0.8rem 0 0;
+}
+.cp-diagram .table-scroll table {
+  min-width: 610px;
+  background: #fcfdfb;
+}
+.cp-diagram th,
+.cp-diagram td {
+  padding: 0.65rem;
+}
+.cp-diagram td code {
+  white-space: nowrap;
+}
+.cp-diagram .caption {
+  margin-bottom: 0;
+}
+.cp-chip {
+  display: inline-block;
+  margin: 0.12rem 0;
+  padding: 0.05rem 0.3rem;
+  border-radius: 0.25rem;
+  white-space: nowrap;
+}
+.cp-diagram .cp-r0 {
+  background: #dcebd6;
+  color: #254936;
+}
+.cp-diagram .cp-r1 {
+  background: #dce8f4;
+  color: #264760;
+}
+.cp-diagram .cp-empty {
+  background: #efefe9;
+  color: #555b53;
+}

@@ -376,5 +376,107 @@
       "before_line": 1294,
       "text": "先完成复制，再让 forward 读取目标页。"
     }
+  ],
+  "cp-rank-groups": [
+    {
+      "before_line": 2246,
+      "text": "交换末两维后，DCP 先沿 PCP 坐标收集 rank。"
+    },
+    {
+      "before_line": 2260,
+      "text": "PCP 组固定 TP 坐标，收集该列中的 rank。"
+    }
+  ],
+  "cp-pcp-split": [
+    {
+      "before_line": 296,
+      "text": "按 2×PCP 切分 query，rank 取互补的早晚片段。"
+    },
+    {
+      "before_line": 307,
+      "text": "需要 DCP 分片参与时，decode query 在参与 rank 上复制。"
+    }
+  ],
+  "cp-pcp-tables": [
+    {
+      "before_line": 777,
+      "text": "局部片段的 idx_mapping 可以重复引用同一个请求状态。"
+    },
+    {
+      "before_line": 791,
+      "text": "用全局 batch 的位置计算本机 slot，然后再按交换后的顺序重排。"
+    }
+  ],
+  "cp-ascend-global-table": [
+    {
+      "before_line": 826,
+      "text": "把每条局部片段关联回全局 batch 的请求行。"
+    },
+    {
+      "before_line": 836,
+      "text": "从本机 BlockTables 收集全局请求行，物理页 ID 仍指向本机池。"
+    }
+  ],
+  "cp-manager-block": [
+    {
+      "before_line": 107,
+      "text": "是否启用 DCP 分片由当前 cache spec 决定。"
+    },
+    {
+      "before_line": 109,
+      "text": "全局每列表项覆盖 B×D 个 token，PCP 大小不参与这个乘积。"
+    }
+  ],
+  "cp-slot": [
+    {
+      "before_line": 391,
+      "text": "先按虚拟 block 找到表列和全局块内偏移。"
+    },
+    {
+      "before_line": 394,
+      "text": "每 I 个位置换一次 owner，当前 rank 只写自己负责的槽。"
+    },
+    {
+      "before_line": 398,
+      "text": "把全局位置压紧成本机页位置。"
+    },
+    {
+      "before_line": 411,
+      "text": "非本机分片的位置输出 PAD_ID。"
+    }
+  ],
+  "cp-ascend-decode": [
+    {
+      "before_line": 468,
+      "text": "准备当前 rank 需要的 query head。"
+    },
+    {
+      "before_line": 479,
+      "text": "kernel 读取本机 KV，返回该分片的输出和 LSE。"
+    }
+  ],
+  "cp-lse": [
+    {
+      "before_line": 569,
+      "text": "每个 query、每个 head 都有自己的分片权重。"
+    },
+    {
+      "before_line": 576,
+      "text": "减去最大 LSE 后按对应底数还原相对权重。"
+    },
+    {
+      "before_line": 589,
+      "text": "按分片维度求加权和。"
+    }
+  ],
+  "cp-local-len": [
+    {
+      "before_line": 1198,
+      "text": "每一整轮 I×D 个 token，为每个 rank 提供 I 个本地位置。"
+    },
+    {
+      "before_line": 1205,
+      "text": "尾部减去当前 rank 之前的 token，再限制到 0…I。"
+    }
   ]
 }
