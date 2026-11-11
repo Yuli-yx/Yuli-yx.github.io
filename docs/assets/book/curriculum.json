@@ -32,7 +32,7 @@
     "scope": "逐项解释 block size、dtype、page bytes、状态 shape 与压缩比例；跟踪 padding、分组与 backing/view 的关系。",
     "body": "chapters/04-layout.html",
     "description": "把模型缓存需求换算成页大小、分组和字节地址，区分每层页、池 ID 与共享 backing。",
-    "updated": "2026.11.06"
+    "updated": "2026.11.11"
   },
   {
     "id": "05",

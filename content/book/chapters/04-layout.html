@@ -3,10 +3,130 @@
 <section id="page-bytes"><h2>2. 从元素数算到页字节数</h2><p>先计算一个 token 在一层中的 K 和 V。K 有 <code>2 heads × 8 elements = 16 elements</code>；V 也有 16 个元素。两者合计 32 个 BF16 元素，乘每元素 2 bytes，得到 64 bytes。一个 block 覆盖 4 token，所以：</p><pre><code>每 token、每层：Hkv × (Dk + Dv) × s
                  = 2 × (8 + 8) × 2 = 64 bytes
 每页、每层：     B × Hkv × (Dk + Dv) × s
-                 = 4 × 2 × 16 × 2 = 256 bytes</code></pre><p><code>B</code> 是每页 token 数，<code>Hkv</code> 是本 rank 的 KV head 数，<code>Dk/Dv</code> 是 K/V head 维度，<code>s</code> 是元素字节数。常见写法 <code>2 × B × Hkv × D × s</code> 隐含了 <code>Dk = Dv = D</code>，前面的 2 才代表 K 与 V。</p><p>源码进一步把页看成 head slot、stored state 和 cell content 三个维度：<code>num_heads × num_states × state_content_size_bytes</code>。普通例子中它们分别是 2、4、32 bytes，因此仍然是 256 bytes。若 backend 设置 <code>num_head_slots</code> 或 <code>state_content_bytes</code>，应读这些覆盖值，不能继续套普通 KV 公式。</p><p>假设一个教学压缩 spec 的 <code>tokens_per_state = 4</code>、<code>block_size = 16</code>，并满足实现的整除条件，那么每页有 <code>16 / 4 = 4</code> 份 stored state，而不是 16 份。具体状态的字节数仍由该 spec 决定。对 recurrent state，<code>MambaSpec</code> 按多份 shape 和 dtype 求和：例如 <code>[2,8,8]</code> FP32 为 512 bytes，<code>[3,32]</code> BF16 为 192 bytes，合计 704 bytes；这是一份状态集合的大小，不应再乘历史 token 数。</p><p>如果普通页的有效数值占 256 bytes，但 <code>page_size_padded = 320</code>，分配记账就采用 320 bytes，额外 64 bytes 是页 padding。它既不是新 token 的 K/V，也不是请求尾块的空位。这两个来源的浪费应分别记录。</p>{{source:m-state-count}}{{source:m-state-bytes}}</section>
-<section id="group-semantics"><h2>3. Group 共享 block table，不等于层共享 K/V 数值</h2><p><code>KVCacheGroupSpec</code> 将一组模型层交给同一种管理方式。组内层共享请求的 block table。假设 G0 包含 L0、L1 两层，请求 A 在 G0 的表为 <code>[5,2,7]</code>：A 的第 0 个逻辑 block 在 L0 中用页 5，在 L1 中也用页 5。但 L0 和 L1 的页 5 通常处于不同的字节区间，保存各自层的 K/V。</p><p>不能只因为两个层的 dtype、head 维度相同，就认定它们一定同组。Full Attention 需要保留完整历史，滑窗层可能提前释放页，递归层还需要状态恢复位置。规划器必须让组内层能共同遵循分配、命中和回收规则。这个版本也支持 <code>UniformTypeKVCacheSpecs</code>，把需要相同 token 槽位数量、但逐层具体尺寸不同的 spec 放进一个 group；因此“一个 group 的所有层 shape 必须完全一样”也不准确。</p><p>默认规划路径先检查完全一致的 spec，再检查兼容的 uniform type，然后尝试其他分组与页大小统一方案。模型或平台还可以提供自己的 builder。读一个实际模型时，应先记下最终的 <code>layer_names</code> 和 <code>kv_cache_spec</code>，再讨论 group 数量，不从层数比例猜分组结果。</p>{{source:m-group}}{{source:m-grouping}}</section>
+                 = 4 × 2 × 16 × 2 = 256 bytes</code></pre><figure class="layout-figure" id="fig-page-bytes">
+  <figcaption>一层的一页怎样凑出 256 bytes</figcaption>
+  <ol class="layout-grid layout-token-grid" aria-label="一页的四个 token 槽位">
+    <li class="layout-box"><strong>slot 0</strong><span class="layout-pair"><span>K · 32 B</span><span>V · 32 B</span></span></li>
+    <li class="layout-box"><strong>slot 1</strong><span class="layout-pair"><span>K · 32 B</span><span>V · 32 B</span></span></li>
+    <li class="layout-box"><strong>slot 2</strong><span class="layout-pair"><span>K · 32 B</span><span>V · 32 B</span></span></li>
+    <li class="layout-box"><strong>slot 3</strong><span class="layout-pair"><span>K · 32 B</span><span>V · 32 B</span></span></li>
+  </ol>
+  <p class="layout-note">每格按容量计入 64 bytes。设备上 K、V 和各 token 的排列由第 4 节的 layout 与 backend 决定。</p>
+</figure><p><code>B</code> 是每页 token 数，<code>Hkv</code> 是本 rank 的 KV head 数，<code>Dk/Dv</code> 是 K/V head 维度，<code>s</code> 是元素字节数。常见写法 <code>2 × B × Hkv × D × s</code> 隐含了 <code>Dk = Dv = D</code>，前面的 2 才代表 K 与 V。</p><p>源码进一步把页看成 head slot、stored state 和 cell content 三个维度：<code>num_heads × num_states × state_content_size_bytes</code>。普通例子中它们分别是 2、4、32 bytes，因此仍然是 256 bytes。若 backend 设置 <code>num_head_slots</code> 或 <code>state_content_bytes</code>，应读这些覆盖值，不能继续套普通 KV 公式。</p><p>假设一个教学压缩 spec 的 <code>tokens_per_state = 4</code>、<code>block_size = 16</code>，并满足实现的整除条件，那么每页有 <code>16 / 4 = 4</code> 份 stored state，而不是 16 份。具体状态的字节数仍由该 spec 决定。对 recurrent state，<code>MambaSpec</code> 按多份 shape 和 dtype 求和：例如 <code>[2,8,8]</code> FP32 为 512 bytes，<code>[3,32]</code> BF16 为 192 bytes，合计 704 bytes；这是一份状态集合的大小，不应再乘历史 token 数。</p><p>如果普通页的有效数值占 256 bytes，但 <code>page_size_padded = 320</code>，分配记账就采用 320 bytes，额外 64 bytes 是页 padding。它既不是新 token 的 K/V，也不是请求尾块的空位。这两个来源的浪费应分别记录。</p>{{source:m-state-count}}{{source:m-state-bytes}}</section>
+<section id="group-semantics"><h2>3. 从 block table 找到 group 内各层的页</h2>
+<p>沿用每页 4 token 的例子。假设请求 A 有 10 个 token，位置从 0 到 9。按请求顺序切成 3 个逻辑 block 后，依次查 G0 的 block table <code>[5, 2, 7]</code>，得到物理 block ID。最后一个逻辑 block 只用到页内前两个 slot。</p>
+<figure class="layout-figure" id="fig-block-table">
+  <figcaption>请求 A 的逻辑 block 怎样映射到缓存池</figcaption>
+  <p class="layout-label">按 token 位置分块 · 每块 4 个 slot</p>
+  <ol class="layout-grid layout-three" aria-label="按逻辑顺序读取 block table">
+    <li class="layout-box layout-green">
+      <strong>逻辑 block 0</strong>
+      <span class="layout-block-tokens" role="group" aria-label="token 0 至 3"><span>0</span><span>1</span><span>2</span><span>3</span></span>
+      <b>↓ ID 5</b>
+    </li>
+    <li class="layout-box layout-blue">
+      <strong>逻辑 block 1</strong>
+      <span class="layout-block-tokens" role="group" aria-label="token 4 至 7"><span>4</span><span>5</span><span>6</span><span>7</span></span>
+      <b>↓ ID 2</b>
+    </li>
+    <li class="layout-box layout-amber">
+      <strong>逻辑 block 2</strong>
+      <span class="layout-block-tokens" role="group" aria-label="token 8 至 9，两个空槽位"><span>8</span><span>9</span><span class="layout-slot-empty">—</span><span class="layout-slot-empty">—</span></span>
+      <b>↓ ID 7</b>
+    </li>
+  </ol>
+  <p class="layout-label">缓存池中的物理 block ID</p>
+  <ol class="layout-grid layout-pool" aria-label="按物理 ID 0 到 7 排列的缓存池">
+    <li class="layout-box">0</li>
+    <li class="layout-box">1</li>
+    <li class="layout-box layout-blue" aria-label="ID 2，逻辑 block 1">2</li>
+    <li class="layout-box">3</li>
+    <li class="layout-box">4</li>
+    <li class="layout-box layout-green" aria-label="ID 5，逻辑 block 0">5</li>
+    <li class="layout-box">6</li>
+    <li class="layout-box layout-amber" aria-label="ID 7，逻辑 block 2">7</li>
+  </ol>
+  <p class="layout-note">以 token 9 为例，<code>9 ÷ 4</code> 的商是 2，查表得到 ID 7，余数 1 是页内 slot。ID 7 的 slot 2、3 仍属于已分配的尾页。</p>
+</figure>
+<p><code>KVCacheGroupSpec</code> 将一组模型层交给同一种管理方式。设 G0 包含 L0、L1 两层。两层都按 A 在 G0 的同一张表查 ID，各自在该 ID 对应的页中读写本层的 K/V。</p>
+<figure class="layout-figure" id="fig-group-pages">
+  <figcaption>G0 共用一张 block table，L0 和 L1 各有自己的页</figcaption>
+  <div class="layout-group" role="group" aria-label="请求 A 在 G0 的表及两层的页">
+    <span class="layout-label">A · G0 表</span>
+    <span class="layout-box layout-green">5</span><span class="layout-box layout-blue">2</span><span class="layout-box layout-amber">7</span>
+    <span class="layout-label">L0 的页</span>
+    <span class="layout-box layout-green">L0 · 5</span><span class="layout-box layout-blue">L0 · 2</span><span class="layout-box layout-amber">L0 · 7</span>
+    <span class="layout-label">L1 的页</span>
+    <span class="layout-box layout-green">L1 · 5</span><span class="layout-box layout-blue">L1 · 2</span><span class="layout-box layout-amber">L1 · 7</span>
+  </div>
+  <p class="layout-note">沿第一列往下看。ID 5 对应 L0 和 L1 各一页，每页 256 bytes，合计 512 bytes。</p>
+</figure><p>不能只因为两个层的 dtype、head 维度相同，就认定它们一定同组。Full Attention 需要保留完整历史，滑窗层可能提前释放页，递归层还需要状态恢复位置。规划器必须让组内层能共同遵循分配、命中和回收规则。这个版本也支持 <code>UniformTypeKVCacheSpecs</code>，把需要相同 token 槽位数量、但逐层具体尺寸不同的 spec 放进一个 group；因此“一个 group 的所有层 shape 必须完全一样”也不准确。</p><p>默认规划路径先检查完全一致的 spec，再检查兼容的 uniform type，然后尝试其他分组与页大小统一方案。模型或平台还可以提供自己的 builder。读一个实际模型时，应先记下最终的 <code>layer_names</code> 和 <code>kv_cache_spec</code>，再讨论 group 数量，不从层数比例猜分组结果。</p>{{source:m-group}}{{source:m-grouping}}</section>
 <section id="physical-placement"><h2>4. 用 offset 和 stride 找到真实字节</h2><p><code>KVCacheTensor</code> 在这里仍是分配描述。它给出 backing 大小、层列表、起始 offset、层 stride 和 block stride。某个描述中的第 <code>l</code> 层、物理 block <code>b</code> 的页起点是：</p><pre><code>page_start_bytes = offset + l × layer_stride + b × block_stride</code></pre><p>这里所有 offset/stride 的单位都是 bytes，<code>l</code> 是当前 <code>layers</code> 列表的下标，不一定等于模型的全局层号。这个公式只定位页起点；页内 K/V、head、token 的排列还要按 layout 与 backend 的 view 解释，不能直接把 slot 当作 byte offset。</p>{{source:m-placement}}
-<p>取单 group、两层、每层每页 256 bytes、8 个物理 ID，总 backing 为 <code>2 × 256 × 8 = 4096 bytes</code>。在不需要额外对齐的教学布局中，可以这样安排：</p><table><thead><tr><th>布局</th><th>layer_stride</th><th>block_stride</th><th>L1 的 block 5 起点</th></tr></thead><tbody><tr><td>layer-outer：先摆完 L0 所有页，再摆 L1</td><td>8 × 256 = 2048 bytes</td><td>256 bytes</td><td>0 + 1 × 2048 + 5 × 256 = 3328 bytes</td></tr><tr><td>block-outer：每个 ID 先摆 L0、L1 两页</td><td>256 bytes</td><td>2 × 256 = 512 bytes</td><td>0 + 1 × 256 + 5 × 512 = 2816 bytes</td></tr></tbody></table><p>同样的 block table 和同样的 4096 bytes，布局可以不同。这正是管理索引与物理排布分开的意义：请求仍通过 ID 5 找页，worker 用确定的布局把它解释成设备地址。</p></section>
-<section id="group-overlay"><h2>5. 多个 group 为什么可以覆盖同一 backing？</h2><p>再构造一个已完成分组的教学配置，使用 block-outer 布局。G0 的两层每层页 256 bytes，合计 512 bytes；G1 的一层页 384 bytes。假设相关对齐已经满足，规划器以较大的 512 bytes 作为每个池 ID 的跨度。8 个 ID 的 backing 仍为 4096 bytes。G1 使用某个 ID 时，384 bytes 放有效页，剩余 128 bytes 不属于该页的有效内容。</p><p>G0 和 G1 的 view 都可以描述全部 8 个 ID，并从同一 backing 的起点建立视图。但分配器不允许 G0 和 G1 同时占用同一个物理 ID。比如请求 A 的 G0 表为 <code>[5,2,7]</code>，G1 表为 <code>[1,3,4]</code>，两组共有六个不同 ID。G0 的 block 5 与 G1 的 block 1 不会冲突；如果两组同时把 ID 5 当自己的有效页，就会覆盖对方数据。</p>{{source:m-pool-stride}}
+<p>取单 group、两层、每层每页 256 bytes、8 个物理 ID，总 backing 为 <code>2 × 256 × 8 = 4096 bytes</code>。在不需要额外对齐的教学布局中，同一批页可以按层排，也可以按 ID 排。</p>
+<figure class="layout-figure" id="fig-physical-layout">
+  <figcaption>沿两种布局找到 L1 的 ID 5</figcaption>
+  <p class="layout-label">layer-outer · 按层排</p>
+  <ol class="layout-grid layout-strip" aria-label="layer-outer · 按层排的页顺序">
+    <li class="layout-box">L0·0</li>
+    <li class="layout-box">L0·1</li>
+    <li class="layout-box">L0·2</li>
+    <li class="layout-box">L0·3</li>
+    <li class="layout-box">L0·4</li>
+    <li class="layout-box">L0·5</li>
+    <li class="layout-box">L0·6</li>
+    <li class="layout-box">L0·7</li>
+    <li class="layout-box">L1·0</li>
+    <li class="layout-box">L1·1</li>
+    <li class="layout-box">L1·2</li>
+    <li class="layout-box">L1·3</li>
+    <li class="layout-box">L1·4</li>
+    <li class="layout-box layout-green">L1·5</li>
+    <li class="layout-box">L1·6</li>
+    <li class="layout-box">L1·7</li>
+  </ol>
+  <p class="layout-label">block-outer · 按 ID 排</p>
+  <ol class="layout-grid layout-strip" aria-label="block-outer · 按 ID 排的页顺序">
+    <li class="layout-box">L0·0</li>
+    <li class="layout-box">L1·0</li>
+    <li class="layout-box">L0·1</li>
+    <li class="layout-box">L1·1</li>
+    <li class="layout-box">L0·2</li>
+    <li class="layout-box">L1·2</li>
+    <li class="layout-box">L0·3</li>
+    <li class="layout-box">L1·3</li>
+    <li class="layout-box">L0·4</li>
+    <li class="layout-box">L1·4</li>
+    <li class="layout-box">L0·5</li>
+    <li class="layout-box layout-green">L1·5</li>
+    <li class="layout-box">L0·6</li>
+    <li class="layout-box">L1·6</li>
+    <li class="layout-box">L0·7</li>
+    <li class="layout-box">L1·7</li>
+  </ol>
+  <p class="layout-note">每格 256 bytes，<code>L1·5</code> 表示 L1 的 ID 5。按从左到右、再换行的顺序数，目标页前面分别有 13 格和 11 格。</p>
+</figure><table><thead><tr><th>布局</th><th>layer_stride</th><th>block_stride</th><th>L1 的 block 5 起点</th></tr></thead><tbody><tr><td>layer-outer：先摆完 L0 所有页，再摆 L1</td><td>8 × 256 = 2048 bytes</td><td>256 bytes</td><td>0 + 1 × 2048 + 5 × 256 = 3328 bytes</td></tr><tr><td>block-outer：每个 ID 先摆 L0、L1 两页</td><td>256 bytes</td><td>2 × 256 = 512 bytes</td><td>0 + 1 × 256 + 5 × 512 = 2816 bytes</td></tr></tbody></table><p>同样的 block table 和同样的 4096 bytes，布局可以不同。这正是管理索引与物理排布分开的意义：请求仍通过 ID 5 找页，worker 用确定的布局把它解释成设备地址。</p></section>
+<section id="group-overlay"><h2>5. 多个 group 为什么可以覆盖同一 backing？</h2><p>再构造一个已完成分组的教学配置，使用 block-outer 布局。G0 的两层每层页 256 bytes，合计 512 bytes；G1 的一层页 384 bytes。假设相关对齐已经满足，规划器以较大的 512 bytes 作为每个池 ID 的跨度。8 个 ID 的 backing 仍为 4096 bytes。G1 使用某个 ID 时，384 bytes 放有效页，剩余 128 bytes 不属于该页的有效内容。</p><p>G0 和 G1 的 view 都可以描述全部 8 个 ID，并从同一 backing 的起点建立视图。但分配器不允许 G0 和 G1 同时占用同一个物理 ID。比如请求 A 的 G0 表为 <code>[5,2,7]</code>，G1 表为 <code>[1,3,4]</code>，两组共有六个不同 ID。G0 的 block 5 与 G1 的 block 1 不会冲突；如果两组同时把 ID 5 当自己的有效页，就会覆盖对方数据。</p><figure class="layout-figure" id="fig-group-overlay">
+  <figcaption>两个 group 在同一 backing 中占用不同 ID</figcaption>
+  <p class="layout-label">请求 A · G0 <code>[5, 2, 7]</code> · G1 <code>[1, 3, 4]</code></p>
+  <ol class="layout-grid layout-pool" aria-label="按 ID 0 到 7 排列的 backing，每格 512 bytes">
+    <li class="layout-box"><strong>0</strong><small>—</small></li>
+    <li class="layout-box layout-purple"><strong>1</strong><small>G1</small></li>
+    <li class="layout-box layout-blue"><strong>2</strong><small>G0</small></li>
+    <li class="layout-box layout-purple"><strong>3</strong><small>G1</small></li>
+    <li class="layout-box layout-purple"><strong>4</strong><small>G1</small></li>
+    <li class="layout-box layout-green"><strong>5</strong><small>G0</small></li>
+    <li class="layout-box"><strong>6</strong><small>—</small></li>
+    <li class="layout-box layout-amber"><strong>7</strong><small>G0</small></li>
+  </ol>
+  <p class="layout-label">ID 1 · G1</p>
+  <div class="layout-grid layout-byte-bar layout-byte-bar-g1">
+    <span class="layout-box layout-purple">G1 层页<br>384 B</span><span class="layout-box">空隙<br>128 B</span>
+  </div>
+  <p class="layout-label">ID 5 · G0</p>
+  <div class="layout-grid layout-byte-bar">
+    <span class="layout-box layout-green">L0 层页<br>256 B</span><span class="layout-box layout-green">L1 层页<br>256 B</span>
+  </div>
+  <p class="layout-note">每个 ID 的跨度是 512 bytes，图中两条拆分条各展开一个 ID。横杠表示请求 A 未占用该 ID。</p>
+</figure>{{source:m-pool-stride}}
 <p>因而有三种不同数字：两个 group 的 view 可以共同引用 4096 bytes backing；请求占用六个 ID，对池的容量占用是 <code>6 × 512 = 3072 bytes</code>；这些 ID 中各层页的大小合计是 <code>3 × 512 + 3 × 384 = 2688 bytes</code>。两者相差的 384 bytes 来自 G1 的三份组间空隙，尚未扣除 token 尾块等有效数据差额。把每个描述里的 <code>size=4096</code> 相加，会把同一 backing 重复计算。</p><p>这个例子只说明已经确定的两组怎样摆放，不声称默认 builder 必然将某个模型分成这两组。特殊 host pool、HiSparse、平台自定义分配器和跨层共享还需要单独核查；这里描述的是引用源码中的默认设备 backing 路径。</p></section>
 <section id="layout-checklist"><h2>6. 把四种“大小”放回各自位置</h2><table><thead><tr><th>要问的问题</th><th>应该查看的对象</th></tr></thead><tbody><tr><td>一个管理 block 覆盖多少原始 token？</td><td>spec 的 block_size，以及压缩 / 并行语义</td></tr><tr><td>某层的一页占多少字节？</td><td>page_size_bytes、状态 shape、dtype、padding</td></tr><tr><td>一个池 ID 在设备上占多少容量？</td><td>builder 的 pool bytes per block，不能只看某层页大小</td></tr><tr><td>kernel 如何读这一页？</td><td>layout、tensor stride、kernel block size 和 backend 的 view</td></tr></tbody></table><p>管理 block 与 kernel block 还可能不同。例如一个 16-token 管理 block 被 backend 虚拟拆成两个 8-token kernel block时，kernel 表和索引需要适配，不能直接把管理 ID 当成 kernel ID。具体拆分能力由 backend 决定。下一章将用确定下来的 page 与 pool stride，把内存预算转换成实际缓存池。</p>{{source:m-kernel-block}}</section>

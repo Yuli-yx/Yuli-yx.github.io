@@ -60,3 +60,144 @@
   background: #efefe9;
   color: #555b53;
 }
+
+/* Chapter 4 cache layout diagrams */
+.layout-figure {
+  margin: 1.75rem 0;
+  padding: clamp(0.65rem, 3vw, 1.25rem);
+  border: 1px solid #d5dece;
+  border-radius: 0.65rem;
+  background: #f2f6ef;
+  font-size: 0.875rem;
+  line-height: 1.5;
+}
+.layout-figure figcaption {
+  margin-bottom: 0.85rem;
+  font-size: 1rem;
+  font-weight: 600;
+}
+.layout-grid,
+.layout-group {
+  display: grid;
+  gap: 0.35rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.layout-token-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+.layout-three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.layout-pool,
+.layout-strip {
+  grid-template-columns: repeat(8, minmax(0, 1fr));
+}
+.layout-group {
+  grid-template-columns: auto repeat(3, minmax(0, 1fr));
+  align-items: center;
+}
+.layout-box {
+  min-width: 0;
+  padding: 0.45rem 0.2rem;
+  border: 1px solid #d5dece;
+  border-radius: 0.25rem;
+  background: #fcfdfb;
+  text-align: center;
+}
+.layout-box > strong,
+.layout-box > span,
+.layout-box > small,
+.layout-box > b {
+  display: block;
+}
+.layout-box > small {
+  font-size: 0.75rem;
+}
+.layout-box > b {
+  margin-top: 0.3rem;
+}
+.layout-box > .layout-block-tokens {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 2px;
+  margin: 0.4rem 0.1rem 0;
+  font-size: 0.75rem;
+}
+.layout-block-tokens span {
+  border-radius: 0.15rem;
+  background: #fffc;
+}
+.layout-block-tokens .layout-slot-empty {
+  background: #f2eee6;
+}
+.layout-box > .layout-pair {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0.4rem 0.15rem 0;
+  font-size: 0.75rem;
+}
+.layout-pair span {
+  padding: 0.15rem 0;
+  background: #e4ede0;
+}
+.layout-pair span + span {
+  background: #edf0e6;
+}
+.layout-label {
+  margin: 0.85rem 0 0.35rem;
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+.layout-group .layout-label {
+  margin: 0 0.3rem 0 0;
+}
+.layout-note {
+  margin: 0.85rem 0 0;
+  color: #4e5d50;
+  font-size: 0.82rem;
+  line-height: 1.7;
+}
+.layout-strip .layout-box {
+  font: 0.76rem/1.5 Consolas, monospace;
+}
+.layout-byte-bar {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.layout-byte-bar-g1 {
+  grid-template-columns: minmax(0, 3fr) minmax(0, 1fr);
+}
+.layout-green {
+  background: #dcebd6;
+  border-color: #a6bfa0;
+  color: #254936;
+}
+.layout-blue {
+  background: #dce8f4;
+  border-color: #aebfd2;
+  color: #264760;
+}
+.layout-amber {
+  background: #faeddb;
+  border-color: #d9bd99;
+  color: #6a471e;
+}
+.layout-purple {
+  background: #eee6f5;
+  border-color: #c8b5d6;
+  color: #533a65;
+}
+@media (max-width: 560px) {
+  .layout-token-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .layout-strip {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+@media print {
+  .layout-figure {
+    break-inside: avoid;
+  }
+}
